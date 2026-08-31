@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveBusiness, UNAUTHORIZED } from "@/lib/supabase/auth";
 import { supabaseAdmin, serviceRoleKeyProblem } from "@/lib/supabase/server";
+import { GEMINI_MODELS } from "@/lib/ai/gemini";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -96,7 +97,7 @@ export async function GET(request: NextRequest) {
         headers: { "x-goog-api-key": geminiKey },
       });
       const body = (await res.json().catch(() => ({}))) as {
-        models?: Array<{ name?: string }>;
+        models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
         error?: { message?: string };
       };
 
@@ -108,6 +109,59 @@ export async function GET(request: NextRequest) {
           : `${shape(geminiKey)} — Google says: ${body.error?.message ?? res.status}`,
         fix: res.ok ? undefined : "Create a fresh key at aistudio.google.com/apikey, then REDEPLOY.",
       });
+
+      // ---- Do the models we actually call exist on this key? ----
+      //
+      // "50 models available" says nothing about whether gemini-2.5-flash is
+      // one of them. A retired or misspelled model name 404s on every single
+      // request while the key above tests perfectly, so this is the one check
+      // that catches the most confusing failure this app has.
+      if (res.ok) {
+        const available = new Set(
+          (body.models ?? [])
+            .map((m) => (m.name ?? "").replace(/^models\//, ""))
+            .filter(Boolean)
+        );
+        // An older key listing may omit the field entirely; only trust it when
+        // at least one model declares it, so we never invent a failure.
+        const declaresMethods = (body.models ?? []).some((m) =>
+          Array.isArray(m.supportedGenerationMethods)
+        );
+        const canGenerate = new Set(
+          (body.models ?? [])
+            .filter(
+              (m) =>
+                !declaresMethods ||
+                (m.supportedGenerationMethods ?? []).includes("generateContent")
+            )
+            .map((m) => (m.name ?? "").replace(/^models\//, ""))
+            .filter(Boolean)
+        );
+
+        const usable = GEMINI_MODELS.filter((m) => canGenerate.has(m));
+        const missing = GEMINI_MODELS.filter((m) => !available.has(m));
+        const noGenerate = GEMINI_MODELS.filter(
+          (m) => available.has(m) && !canGenerate.has(m)
+        );
+
+        const problems = [
+          missing.length ? `not on this key: ${missing.join(", ")}` : "",
+          noGenerate.length ? `can't generate text: ${noGenerate.join(", ")}` : "",
+        ].filter(Boolean);
+
+        checks.push({
+          name: "Gemini models",
+          ok: usable.length > 0,
+          detail: problems.length
+            ? `Configured: ${GEMINI_MODELS.join(", ")} — ${problems.join("; ")}.` +
+              (usable.length ? ` Still usable: ${usable.join(", ")}.` : "")
+            : `All ${GEMINI_MODELS.length} configured model(s) exist and can generate: ${GEMINI_MODELS.join(", ")}.`,
+          fix:
+            usable.length === 0
+              ? "Every model name this app calls was rejected by your key. Set GEMINI_MODEL in Vercel to one Google lists for you, then REDEPLOY."
+              : undefined,
+        });
+      }
     } catch (error) {
       checks.push({
         name: "Gemini API key",

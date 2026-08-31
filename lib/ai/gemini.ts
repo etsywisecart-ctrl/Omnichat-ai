@@ -14,8 +14,28 @@ import { createOrder, type ChannelType } from "@/lib/orders/create";
 const MAX_TOOL_ROUNDS = 3;
 const CATALOG_CONTEXT_LIMIT = 20;
 
-/** Models tried in order; the next one is used when a model is busy or down. */
-const GEMINI_MODELS = Array.from(
+/**
+ * Room for a reply. Generous on purpose: this budget also covers any thinking
+ * the model does, and a customer answer cut off mid-sentence is worse than a
+ * slightly slower one.
+ */
+const MAX_OUTPUT_TOKENS = 2048;
+
+/**
+ * Whether a model accepts `thinkingConfig`. Sending it to one that doesn't —
+ * 2.0 and 1.5 — is a 400 on every request, so this must stay a whitelist.
+ */
+function supportsThinking(model: string): boolean {
+  return /^gemini-(2\.5|3)/.test(model);
+}
+
+/**
+ * Models tried in order; the next one is used when a model is busy or down.
+ * Exported so /api/diagnostics can check these exact names against the key —
+ * a retired model name fails every single request while the key itself tests
+ * perfectly, and nothing else in the app would ever reveal that.
+ */
+export const GEMINI_MODELS = Array.from(
   new Set(
     [
       process.env.GEMINI_MODEL || process.env.NEXT_PUBLIC_GEMINI_MODEL,
@@ -146,11 +166,66 @@ function sanitizeFilter(term: string): string {
 }
 
 /**
+ * Words that carry no product meaning. A customer asks in sentences — "do you
+ * have an espresso cup set?" — and every one of these appears in that sentence
+ * without narrowing the catalog at all.
+ */
+const STOPWORDS = new Set([
+  "a", "about", "am", "an", "and", "any", "anything", "are", "at", "available",
+  "be", "buy", "by", "can", "cost", "costs", "could", "descuento", "do", "does",
+  "doing", "for", "from", "get", "give", "got", "hai", "has", "have", "hello",
+  "help", "hey", "hi", "how", "i", "if", "in", "is", "it", "its", "just", "kya",
+  "like", "looking", "many", "me", "much", "my", "need", "of", "on", "one",
+  "or", "order", "please", "price", "prices", "product", "products", "sell",
+  "send", "show", "some", "sth", "stock", "tell", "thanks", "that", "the",
+  "their", "them", "there", "these", "they", "this", "to", "us", "want",
+  "was", "we", "what", "whats", "when", "where", "which", "will", "with",
+  "would", "you", "your", "yours",
+]);
+
+/** How many words we are willing to turn into ILIKE patterns. */
+const MAX_SEARCH_KEYWORDS = 5;
+
+/**
+ * Pull the words worth searching for out of a customer's sentence.
+ *
+ * Longest first, because the specific word ("espresso") is almost always
+ * longer than the generic one ("set"), and we only get five.
+ */
+export function searchKeywords(query: string): string[] {
+  const words = (query || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .split(/\s+/)
+    .map((w) => w.replace(/^-+|-+$/g, ""))
+    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+
+  const seen = new Set<string>();
+  const unique = words.filter((w) => (seen.has(w) ? false : (seen.add(w), true)));
+
+  // Nothing but stopwords ("do you have any?") — fall back to the whole
+  // phrase rather than searching for nothing at all.
+  if (unique.length === 0) {
+    const whole = (query || "").trim().toLowerCase();
+    return whole ? [whole] : [];
+  }
+
+  return [...unique]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, MAX_SEARCH_KEYWORDS);
+}
+
+/**
  * Look up products, reporting *why* nothing came back.
  *
  * "No such product" and "the database rejected our key" produce the same empty
  * array, and telling a customer we can't find their mug when the real problem is
  * a missing environment variable sends everyone hunting in the wrong place.
+ *
+ * Matching is per keyword, not per sentence. Sending "do you have an espresso
+ * cup set" to the database as one ILIKE pattern looks for a product literally
+ * named that, finds nothing, and reports an empty catalog — while the single
+ * word "cup" finds the same product immediately.
  */
 async function searchCatalog(
   businessId: string,
@@ -161,22 +236,60 @@ async function searchCatalog(
   if (keyProblem) return { matches: [], error: keyProblem };
 
   if (!businessId) return { matches: [], error: "No business id was supplied with the message." };
-  const term = sanitizeFilter(query || "");
-  if (!term) return { matches: [], error: null };
 
+  const keywords = searchKeywords(query)
+    .map((word) => sanitizeFilter(word))
+    .filter(Boolean);
+  if (keywords.length === 0) return { matches: [], error: null };
+
+  const filters = keywords.flatMap((word) => [
+    `name.ilike.%${word}%`,
+    `sku.ilike.%${word}%`,
+    `description.ilike.%${word}%`,
+  ]);
+
+  // Over-fetch: the database returns matches in no useful order, so ranking
+  // has to happen here, and ranking the first `limit` rows ranks nothing.
   const { data, error } = await supabaseAdmin
     .from("products")
     .select("id, name, sku, price_cents, currency, description")
     .eq("business_id", businessId)
     .eq("is_active", true)
-    .or(`name.ilike.%${term}%,sku.ilike.%${term}%,description.ilike.%${term}%`)
-    .limit(limit);
+    .or(filters.join(","))
+    .limit(Math.max(limit * 6, 30));
 
   if (error) {
     console.error("searchCatalog failed:", error);
     return { matches: [], error: `Catalog lookup failed: ${error.message}` };
   }
-  return { matches: (data ?? []) as CatalogMatch[], error: null };
+
+  const ranked = rankMatches((data ?? []) as CatalogMatch[], keywords).slice(0, limit);
+  return { matches: ranked, error: null };
+}
+
+/**
+ * Order products by how well they match, best first.
+ *
+ * A keyword in the name (or SKU) is the customer naming the product; the same
+ * word buried in a description is a passing mention. Weighted 3 to 1 so a
+ * "Espresso Cup Set" outranks a teapot whose description says "pairs with our
+ * espresso cups".
+ */
+function rankMatches(products: CatalogMatch[], keywords: string[]): CatalogMatch[] {
+  const score = (p: CatalogMatch): number => {
+    const name = `${p.name ?? ""} ${p.sku ?? ""}`.toLowerCase();
+    const description = (p.description ?? "").toLowerCase();
+    return keywords.reduce((total, word) => {
+      if (name.includes(word)) return total + 3;
+      if (description.includes(word)) return total + 1;
+      return total;
+    }, 0);
+  };
+
+  return products
+    .map((p, index) => ({ p, index, score: score(p) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((entry) => entry.p);
 }
 
 function formatPrice(cents: number, currency: string): string {
@@ -335,7 +448,7 @@ async function callGemini(
   systemPrompt: string,
   contents: GeminiContent[],
   useTools: boolean
-): Promise<GeminiPart[] | null> {
+): Promise<GeminiPart[]> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -349,27 +462,59 @@ async function callGemini(
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
         ...(useTools ? { tools: TOOL_DECLARATIONS } : {}),
-        generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
+        generationConfig: {
+          temperature: 0.6,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          // 2.5 models think before answering, and thinking is billed against
+          // the same output budget as the reply. Left on, the model can spend
+          // the whole budget reasoning and return a 200 with no parts at all —
+          // which reads exactly like "the model had nothing to say". A shop
+          // assistant quoting its own catalog does not need a scratchpad.
+          ...(supportsThinking(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+        },
       }),
     }
   );
 
-  if (!res.ok) {
-    console.warn(`Gemini ${model} returned ${res.status}`);
-    return null;
-  }
-
-  const data = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
+  const data = (await res.json().catch(() => ({}))) as {
+    candidates?: Array<{
+      content?: { parts?: GeminiPart[] };
+      finishReason?: string;
+    }>;
+    promptFeedback?: { blockReason?: string };
+    error?: { message?: string; status?: string };
   };
 
-  return data.candidates?.[0]?.content?.parts ?? null;
+  // Throw rather than return null. A silent null is indistinguishable from
+  // "the model had nothing to say", so every failure used to land the customer
+  // on the catalog fallback with no record anywhere of what went wrong. The
+  // caller turns this message into the reason line under the reply.
+  if (!res.ok) {
+    const detail = data.error?.message || res.statusText || "no detail";
+    throw new Error(`HTTP ${res.status} — ${detail}`);
+  }
+
+  const candidate = data.candidates?.[0];
+  const parts = candidate?.content?.parts;
+
+  if (!parts || parts.length === 0) {
+    // A 200 with no parts is how a safety block arrives, and how an output
+    // budget spent entirely on reasoning arrives. finishReason names which.
+    const why =
+      data.promptFeedback?.blockReason ??
+      candidate?.finishReason ??
+      "returned no content";
+    throw new Error(`answered with nothing (${why})`);
+  }
+
+  return parts;
 }
 
 /**
  * Run one model through the full tool loop: ask, run any tools it calls, hand
  * the results back, and repeat until it produces prose (or we hit the cap).
- * Returns null so the caller can fall through to the next model.
+ * Throws — with a sentence describing what went wrong — so the caller can fall
+ * through to the next model while keeping a record of why this one didn't work.
  */
 async function runToolLoop(
   model: string,
@@ -379,7 +524,7 @@ async function runToolLoop(
   businessId: string,
   options: ReplyOptions,
   toolsUsed: ToolCall[]
-): Promise<string | null> {
+): Promise<string> {
   const useTools = options.allowTools !== false;
 
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
@@ -392,7 +537,6 @@ async function runToolLoop(
       contents,
       useTools && round < MAX_TOOL_ROUNDS
     );
-    if (!parts) return null;
 
     const calls = parts.filter((p) => p.functionCall?.name);
     const text = parts
@@ -402,7 +546,8 @@ async function runToolLoop(
       .trim();
 
     if (calls.length === 0) {
-      return text || null;
+      if (!text) throw new Error("replied with an empty message");
+      return text;
     }
 
     // Record the model's turn verbatim, then answer each call.
@@ -434,7 +579,9 @@ async function runToolLoop(
     contents.push({ role: "user", parts: responseParts });
   }
 
-  return null;
+  throw new Error(
+    `was still calling tools after ${MAX_TOOL_ROUNDS} rounds and never wrote an answer`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -500,9 +647,7 @@ export async function generateCustomerReply(
           options,
           toolsUsed
         );
-        if (text) {
-          return { text, source: "gemini", model, toolsUsed, matchedProducts: [] };
-        }
+        return { text, source: "gemini", model, toolsUsed, matchedProducts: [] };
       } catch (error) {
         console.warn(`Gemini ${model} failed, trying the next model:`, error);
         reasons.push(`${model}: ${error instanceof Error ? error.message : "failed"}`);
