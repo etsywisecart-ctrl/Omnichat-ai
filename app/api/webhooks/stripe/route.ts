@@ -1,93 +1,88 @@
 import { NextRequest, NextResponse } from "next/server";
+import Stripe from "stripe";
 import { supabaseAdmin } from "@/lib/supabase/server";
-import crypto from "crypto";
 
-function verifyStripeSignature(
-  body: string,
-  signature: string,
-  secret: string
-): boolean {
-  try {
-    const hash = crypto
-      .createHmac("sha256", secret)
-      .update(body)
-      .digest("hex");
-
-    return hash === signature.replace("t=", "").split(",")[0];
-  } catch {
-    return false;
-  }
-}
+export const runtime = "nodejs";
 
 /**
  * POST /api/webhooks/stripe
- * Handle Stripe webhook events (checkout.session.completed, payment_intent.succeeded)
+ *
+ * Stripe calls this when a checkout completes. Signature verification is done
+ * by the Stripe SDK against the raw request body — never hand-rolled, and
+ * never skipped: a missing secret is a hard failure, not a bypass.
+ *
+ * This runs with the service-role client because Stripe is not a signed-in
+ * user; the event's own metadata names the order, and the signature is what
+ * proves the request is genuine.
  */
 export async function POST(request: NextRequest) {
-  const body = await request.text();
-  const signature = request.headers.get("stripe-signature") || "";
-  const secret = process.env.STRIPE_WEBHOOK_SECRET || "";
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  const apiKey = process.env.STRIPE_SECRET_KEY;
 
-  if (!secret) {
-    console.warn("STRIPE_WEBHOOK_SECRET not configured");
-    return new NextResponse("Webhook secret not configured", { status: 500 });
+  if (!secret || !apiKey) {
+    console.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET or STRIPE_SECRET_KEY missing");
+    return NextResponse.json(
+      { error: "not_configured", message: "Stripe webhooks are not configured." },
+      { status: 500 }
+    );
   }
 
-  // Verify signature and construct event at runtime
+  const body = await request.text();
+  const signature = request.headers.get("stripe-signature") ?? "";
+
+  let event: Stripe.Event;
   try {
-    // Initialize Stripe at runtime
-    const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+    const stripe = new Stripe(apiKey);
+    event = stripe.webhooks.constructEvent(body, signature, secret);
+  } catch (error) {
+    console.error("Stripe signature verification failed:", error);
+    return NextResponse.json({ error: "invalid_signature" }, { status: 400 });
+  }
 
-    const event = stripe.webhooks.constructEvent(body, signature, secret);
-
+  try {
     if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
+      const session = event.data.object as Stripe.Checkout.Session;
       const orderId = session.metadata?.order_id;
+      const businessId = session.metadata?.business_id;
 
-      if (orderId) {
-        // Update order status to paid
-        const { error } = await supabaseAdmin
-          .from("orders")
-          .update({
-            status: "paid",
-            stripe_payment_intent_id: session.payment_intent,
-          })
-          .eq("id", orderId);
+      if (!orderId || !businessId) {
+        // Not one of ours — acknowledge so Stripe stops retrying.
+        return NextResponse.json({ received: true, ignored: "missing_metadata" });
+      }
 
-        if (error) {
-          console.error("Failed to update order:", error);
-          return new NextResponse("Order update failed", { status: 500 });
-        }
+      const { data: order, error: updateError } = await supabaseAdmin
+        .from("orders")
+        .update({
+          status: "paid",
+          stripe_payment_intent_id:
+            typeof session.payment_intent === "string" ? session.payment_intent : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", orderId)
+        .eq("business_id", businessId)
+        .select("id, display_id, conversation_id")
+        .maybeSingle();
 
-        // Send a message to the conversation if associated
-        const { data: order } = await supabaseAdmin
-          .from("orders")
-          .select("conversation_id")
-          .eq("id", orderId)
-          .maybeSingle();
+      if (updateError) {
+        console.error("Failed to mark order paid:", updateError);
+        return NextResponse.json({ error: "update_failed" }, { status: 500 });
+      }
 
-        if (order?.conversation_id) {
-          await supabaseAdmin.from("messages").insert({
-            business_id: session.metadata.business_id,
-            conversation_id: order.conversation_id,
-            sender_type: "system",
-            direction: "incoming",
-            body: `Payment received! Order ${order.display_id} is confirmed.`,
-          });
-        }
+      // Confirm in the chat thread the order came from.
+      if (order?.conversation_id) {
+        await supabaseAdmin.from("messages").insert({
+          business_id: businessId,
+          conversation_id: order.conversation_id,
+          sender_type: "system",
+          direction: "outgoing",
+          body: `Payment received — order ${order.display_id} is confirmed.`,
+        });
       }
     }
 
-    if (event.type === "payment_intent.succeeded") {
-      const paymentIntent = event.data.object;
-      console.log("Payment intent succeeded:", paymentIntent.id);
-
-      // Additional processing if needed
-    }
-
-    return new NextResponse(JSON.stringify({ received: true }), { status: 200 });
-  } catch (err) {
-    console.error("Webhook error:", err);
-    return new NextResponse("Webhook error", { status: 400 });
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error("Stripe webhook handling error:", error);
+    return NextResponse.json({ error: "server_error" }, { status: 500 });
   }
 }

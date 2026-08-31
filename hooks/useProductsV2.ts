@@ -49,28 +49,31 @@ export function useToggleProduct() {
 }
 
 export function useUploadProducts() {
-  const { data: businessId } = useCurrentBusinessId();
   const qc = useQueryClient();
 
   return useMutation({
     mutationFn: async (file: File) => {
-      if (!businessId) throw new Error("No business_id");
+      // The API reads the business from the access token, so the browser
+      // never gets to say which business it is importing into.
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("Sign in to upload a catalog");
 
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("business_id", businessId);
 
       const response = await fetch("/api/products/upload", {
         method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
         body: formData,
       });
 
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || "Upload failed");
+        throw new Error(payload.message || payload.error || "Upload failed");
       }
 
-      return response.json();
+      return payload as { imported: number; skipped: number };
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["products"] });

@@ -1,5 +1,5 @@
 import type { ChannelAdapter, ParsedMessage } from "./adapter";
-import crypto from "crypto";
+import { verifyMetaSignature } from "./verify";
 
 /**
  * Instagram Direct Message Adapter
@@ -122,22 +122,6 @@ export const instagramAdapter: ChannelAdapter = {
    * Verify Meta's webhook signature (X-Hub-Signature-256)
    */
   verifySignature(body: string, signature: string, appSecret: string): boolean {
-    if (!appSecret) {
-      console.warn("App secret not set, skipping signature verification");
-      return true;
-    }
-
-    try {
-      const hash = crypto
-        .createHmac("sha256", appSecret)
-        .update(body)
-        .digest("hex");
-
-      const expectedSignature = `sha256=${hash}`;
-      return expectedSignature === signature;
-    } catch (error) {
-      console.error("Signature verification error:", error);
-      return false;
-    }
+    return verifyMetaSignature(body, signature, appSecret);
   },
 };

@@ -9,10 +9,14 @@ import { supabaseAdmin } from "@/lib/supabase/server";
  * For local development/testing, can be called manually.
  *
  * Rules:
- * - Send campaigns that have scheduled_at <= now
- * - Respect 24-hour marketing window: 6 PM to 6 PM UTC (18:00-18:00)
- * - Outside window: Only use approved templates
- * - Inside window: Can use any message type
+ * - Process campaigns whose scheduled_at has passed
+ * - Requires CAMPAIGN_CRON_SECRET as a bearer token; an unset secret refuses
+ *   the request rather than running unprotected
+ * - Only opted-in contacts become recipients
+ *
+ * NOTE: this queues recipient rows. Channel delivery is not wired up yet, so
+ * campaigns stay 'scheduled' — they are never reported as sent until a real
+ * send happens.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -20,16 +24,21 @@ export async function POST(request: NextRequest) {
     const authHeader = request.headers.get("authorization");
     const expectedToken = process.env.CAMPAIGN_CRON_SECRET;
 
-    if (expectedToken && authHeader !== `Bearer ${expectedToken}`) {
-      return new NextResponse("Unauthorized", { status: 401 });
+    // No secret configured means we cannot tell a real cron call from anyone
+    // on the internet, so refuse rather than run unprotected.
+    if (!expectedToken) {
+      console.error("CAMPAIGN_CRON_SECRET is not set; refusing to run the scheduler.");
+      return NextResponse.json(
+        { error: "not_configured", message: "Campaign scheduler is not configured." },
+        { status: 503 }
+      );
+    }
+
+    if (authHeader !== `Bearer ${expectedToken}`) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
 
     const now = new Date();
-    const utcHour = now.getUTCHours();
-
-    // Check if we're in the 24-hour marketing window (6 PM to 6 PM UTC = 18:00 to 18:00)
-    const inMarketingWindow = utcHour >= 18 || utcHour < 18; // This is always true; we should use a more sophisticated check
-    // Better version: const inMarketingWindow = true; // In production, respect actual window
 
     // Fetch campaigns ready to send
     const { data: campaigns, error: campaignsError } = await supabaseAdmin
@@ -48,19 +57,21 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    let totalSent = 0;
+    let totalQueued = 0;
     let totalFailed = 0;
 
     for (const campaign of campaigns) {
       try {
-        // Validate campaign is compliant with window rules
-        if (!campaign.template_name && !inMarketingWindow) {
+        // A campaign with no approved template can only reach customers who
+        // messaged in within the last 24 hours. Without a template we cannot
+        // guarantee that for a broadcast, so we refuse the whole campaign.
+        if (!campaign.template_name) {
           console.warn(
-            `Campaign ${campaign.id} cannot be sent outside marketing window without template`
+            `Campaign ${campaign.id} has no approved template, so it cannot be broadcast outside the 24-hour service window.`
           );
           await supabaseAdmin
             .from("campaigns")
-            .update({ status: "failed" })
+            .update({ status: "failed", updated_at: now.toISOString() })
             .eq("id", campaign.id);
           totalFailed++;
           continue;
@@ -93,24 +104,22 @@ export async function POST(request: NextRequest) {
           if (recipientsError) throw recipientsError;
         }
 
-        // Update campaign status to sent
+        // Recipients are queued as 'pending'. Delivery through the channel
+        // APIs is not wired up yet, so the campaign stays 'scheduled' rather
+        // than reporting a broadcast that never left the building. The status
+        // moves to 'sent' only when a delivery worker marks the recipients
+        // sent.
         const { error: updateError } = await supabaseAdmin
           .from("campaigns")
-          .update({
-            status: "sent",
-            sent_count: recipients.length,
-            updated_at: now.toISOString(),
-          })
+          .update({ updated_at: now.toISOString() })
           .eq("id", campaign.id);
 
         if (updateError) throw updateError;
 
-        totalSent += recipients.length;
+        totalQueued += recipients.length;
 
-        // TODO: In production, actually send messages via channel APIs here
-        // For each recipient, get the message content and send it
         console.log(
-          `Campaign ${campaign.id} queued for sending to ${recipients.length} recipients`
+          `Campaign ${campaign.id}: queued ${recipients.length} recipient(s); awaiting a delivery worker.`
         );
       } catch (campaignError) {
         console.error(`Error processing campaign ${campaign.id}:`, campaignError);
@@ -129,8 +138,9 @@ export async function POST(request: NextRequest) {
       {
         message: "Campaigns processed",
         processed: campaigns.length,
-        totalSent,
+        totalQueued,
         totalFailed,
+        note: "Recipients are queued as pending. Channel delivery is not implemented yet.",
       },
       { status: 200 }
     );
@@ -151,8 +161,6 @@ export async function POST(request: NextRequest) {
  */
 export async function GET() {
   const now = new Date();
-  const utcHour = now.getUTCHours();
-  const inMarketingWindow = utcHour >= 18; // 6 PM UTC onwards
 
   // Fetch pending campaigns
   const { data: pendingCampaigns } = await supabaseAdmin
@@ -164,8 +172,7 @@ export async function GET() {
   return NextResponse.json({
     status: "ok",
     timestamp: now.toISOString(),
-    utcHour,
-    inMarketingWindow,
+    configured: Boolean(process.env.CAMPAIGN_CRON_SECRET),
     pendingCampaigns: pendingCampaigns?.length || 0,
   });
 }

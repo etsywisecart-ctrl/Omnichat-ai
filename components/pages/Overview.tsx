@@ -64,14 +64,14 @@ export default function Overview() {
   type AttnItem = { dotCls: string; t: string; d: string; act: string; go: PageId };
   const attn: AttnItem[] = [];
 
-  // Conversations waiting for a human (backend status "needs_human" -> handed_off).
-  const waitingConvs = (conversations || []).filter((c) => c.status === "needs_human");
+  // Conversations handed off to a human.
+  const waitingConvs = (conversations || []).filter((c) => c.status === "handed_off");
   if (waitingConvs.length > 0) {
     attn.push({
       dotCls: "adot warn",
       t: `${waitingConvs.length} conversation(s) waiting for a human`,
       d: waitingConvs
-        .map((c) => c.name || c.wa_id)
+        .map((c) => c.customer_name || c.customer_identifier)
         .slice(0, 3)
         .join(" · "),
       act: "Open inbox",

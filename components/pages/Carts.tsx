@@ -122,17 +122,20 @@ export default function Carts() {
                     {canSend && (
                       <button
                         className="btn sm"
-                        onClick={() => {
-                          const note = c.within_session_window ? "Sent just now · free-form" : "Sent just now · template";
-                          sendReminder.mutate({ id: c.id, note });
-                          say(
-                            c.within_session_window
-                              ? "Reminder sent — inside the 24h window, free-form allowed"
-                              : "Reminder sent via approved template cart_reminder (outside 24h window)"
-                          );
-                        }}
+                        disabled={sendReminder.isPending}
+                        onClick={() =>
+                          sendReminder.mutate(
+                            { id: c.id },
+                            {
+                              // Say what actually happened, not what we hoped.
+                              onSuccess: () => say("Reminder sent"),
+                              onError: (err) =>
+                                say(err instanceof Error ? err.message : "Couldn't send the reminder"),
+                            }
+                          )
+                        }
                       >
-                        {sendLabel}
+                        {sendReminder.isPending ? "Sending…" : sendLabel}
                       </button>
                     )}
                   </div>

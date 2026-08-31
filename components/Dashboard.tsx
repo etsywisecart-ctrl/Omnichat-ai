@@ -16,6 +16,7 @@ import Settings from "./pages/Settings";
 import { useDashboardStore, isDark } from "@/store/useDashboardStore";
 import { useSession } from "@/hooks/useSession";
 import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
+import { useRealtimeInbox } from "@/hooks/useRealtimeInbox";
 import { LoadingState } from "./State";
 
 export default function Dashboard() {
@@ -27,6 +28,9 @@ export default function Dashboard() {
 
   const { session, loading: sessionLoading } = useSession();
   const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
+
+  // Live updates for every page that reads conversations or messages.
+  useRealtimeInbox(businessId);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");

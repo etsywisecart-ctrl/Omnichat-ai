@@ -80,6 +80,11 @@ export default function Sidebar() {
 
       <div className="f1" />
 
+      <a className="navi" href="/playground">
+        <OutlineIcon d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        <span>Try your agent</span>
+      </a>
+
       <button className="navi" onClick={toggleTheme}>
         <OutlineIcon d={dark ? THEME_ICON.dark : THEME_ICON.light} />
         <span>{dark ? "Light mode" : "Dark mode"}</span>

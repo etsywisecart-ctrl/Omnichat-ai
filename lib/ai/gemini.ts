@@ -1,348 +1,45 @@
-﻿import { supabaseAdmin } from "@/lib/supabase/server";
+import { supabaseAdmin } from "@/lib/supabase/server";
+import { createOrder, type ChannelType } from "@/lib/orders/create";
 
-// The Gemini model to use. Override with GEMINI_MODEL in your env if your
-// key can't access the default (e.g. some regions only expose newer models).
-const GEMINI_MODEL = process.env.NEXT_PUBLIC_GEMINI_MODEL || process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// ============================================================================
+// One AI brain for every channel.
+//
+// There used to be two: getAIReply() declared tools but threw when the API key
+// was missing (500ing the webhook and triggering Meta retries), and
+// generateCustomerReply() had model fallback but no tools. Which one answered
+// a WhatsApp customer depended on which of two near-identical routes Meta was
+// pointed at. This is the merge: tools AND fallback AND never throwing.
+// ============================================================================
 
-interface MessageHistory {
+const MAX_TOOL_ROUNDS = 3;
+const CATALOG_CONTEXT_LIMIT = 20;
+
+/** Models tried in order; the next one is used when a model is busy or down. */
+const GEMINI_MODELS = Array.from(
+  new Set(
+    [
+      process.env.GEMINI_MODEL || process.env.NEXT_PUBLIC_GEMINI_MODEL,
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+    ].filter(Boolean) as string[]
+  )
+);
+
+export interface MessageHistory {
   sender: "customer" | "bot" | "agent";
   text: string;
   timestamp?: string;
 }
 
-interface AIReply {
-  text: string;
-  toolsUsed: Array<{
-    name: string;
-    params: Record<string, unknown>;
-  }>;
-}
-
-/**
- * Get AI reply for a customer message, grounded with business context.
- * Uses Google Gemini (free tier) with function calling for order creation
- * and price lookups.
- */
-export async function getAIReply(
-  businessId: string,
-  customerMessage: string,
-  history: MessageHistory[] = []
-): Promise<AIReply> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY not configured");
-  }
-
-  // Fetch business settings
-  const { data: settings } = await supabaseAdmin
-    .from("agent_settings")
-    .select("*")
-    .eq("business_id", businessId)
-    .maybeSingle();
-
-  // Fetch active products for context
-  const { data: products } = await supabaseAdmin
-    .from("products")
-    .select("id, name, sku, price_cents, currency, description")
-    .eq("business_id", businessId)
-    .eq("is_active", true)
-    .limit(20);
-
-  const productContext =
-    products && products.length > 0
-      ? products
-          .map(
-            (p: { name: string; price_cents: number; currency: string; description?: string }) =>
-              `${p.name}: ${(p.price_cents / 100).toFixed(2)} ${p.currency}${p.description ? ` - ${p.description}` : ""}`
-          )
-          .join("\n")
-      : "No products available";
-
-  const systemPrompt = `You are a helpful e-commerce customer service AI assistant. 
-Your business greeting is: "${settings?.greeting_message || "Hi! How can I help you today?"}"
-Your tone should be: ${settings?.formality || "Neutral"}
-${settings?.emoji_enabled ? "You may use emojis when appropriate." : "Do not use emojis."}
-
-Available Products:
-${productContext}
-
-Guidelines:
-- Be concise and natural in your responses
-- When customers ask about products, reference the available catalog
-- Help customers with questions, product recommendations, and ordering
-- If the customer wants to place an order, use the create_order tool
-- For pricing questions, use the get_product_price tool
-- Maintain context from conversation history`;
-
-  // Gemini requires alternating roles that start with "user". We map the
-  // customer to "user" and the bot/agent to "model".
-  const contents = [
-    ...history.map((m) => ({
-      role: m.sender === "customer" ? ("user" as const) : ("model" as const),
-      parts: [{ text: m.text }],
-    })),
-    {
-      role: "user" as const,
-      parts: [{ text: customerMessage }],
-    },
-  ];
-
-  const tools = [
-    {
-      functionDeclarations: [
-        {
-          name: "get_product_price",
-          description: "Look up the price of a product by name or SKU",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              product_query: {
-                type: "STRING",
-                description: "Product name or SKU to look up",
-              },
-            },
-            required: ["product_query"],
-          },
-        },
-        {
-          name: "create_order",
-          description: "Create a new order with selected products",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              customer_name: {
-                type: "STRING",
-                description: "Name of the customer",
-              },
-              items: {
-                type: "ARRAY",
-                items: {
-                  type: "OBJECT",
-                  properties: {
-                    product_id: {
-                      type: "STRING",
-                      description: "UUID of the product",
-                    },
-                    quantity: {
-                      type: "INTEGER",
-                      description: "Quantity to order",
-                    },
-                  },
-                  required: ["product_id", "quantity"],
-                },
-                description: "Items to include in the order",
-              },
-              channel: {
-                type: "STRING",
-                description: "Channel the order originated from",
-                enum: ["whatsapp", "instagram", "messenger", "web"],
-              },
-            },
-            required: ["customer_name", "items", "channel"],
-          },
-        },
-      ],
-    },
-  ];
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: systemPrompt }],
-          },
-          contents,
-          tools,
-          generationConfig: {
-            maxOutputTokens: 1024,
-          },
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Gemini API error: ${response.status} ${error}`);
-    }
-
-    const data = (await response.json()) as {
-      candidates: Array<{
-        content: {
-          parts: Array<{
-            text?: string;
-            functionCall?: {
-              name?: string;
-              args?: Record<string, unknown>;
-            };
-          }>;
-        };
-      }>;
-    };
-
-    const parts = data.candidates?.[0]?.content?.parts || [];
-
-    let replyText = "";
-    const toolsUsed: Array<{ name: string; params: Record<string, unknown> }> = [];
-
-    for (const part of parts) {
-      if (part.text) {
-        replyText += part.text;
-      } else if (part.functionCall) {
-        toolsUsed.push({
-          name: part.functionCall.name || "",
-          params: part.functionCall.args || {},
-        });
-      }
-    }
-
-    return {
-      text: replyText || "I'm here to help. How can I assist you?",
-      toolsUsed,
-    };
-  } catch (error) {
-    console.error("Gemini API error:", error);
-    throw error;
-  }
-}
-
-export async function processToolCall(
-  businessId: string,
-  toolName: string,
-  params: Record<string, unknown>
-): Promise<{
-  success: boolean;
+export interface ToolCall {
+  name: string;
+  params: Record<string, unknown>;
   result?: unknown;
-  error?: string;
-}> {
-  try {
-    if (toolName === "get_product_price") {
-      const query = String(params.product_query || "");
-      const { data: products } = await supabaseAdmin
-        .from("products")
-        .select("id, name, sku, price_cents, currency")
-        .eq("business_id", businessId)
-        .or(`name.ilike.%${query}%,sku.eq.${query}`)
-        .limit(5);
-
-      if (!products || products.length === 0) {
-        return {
-          success: true,
-          result: "Product not found",
-        };
-      }
-
-      const results = products.map((p: { name: string; price_cents: number; currency: string }) => ({
-        name: p.name,
-        price: `${(p.price_cents / 100).toFixed(2)} ${p.currency}`,
-      }));
-
-      return {
-        success: true,
-        result: results,
-      };
-    }
-
-    if (toolName === "create_order") {
-      const customerName = String(params.customer_name || "Guest");
-      const items = (params.items as Array<{ product_id: string; quantity: number }>) || [];
-      const channel = String(params.channel || "web");
-
-      if (!items || items.length === 0) {
-        return {
-          success: false,
-          error: "No items provided",
-        };
-      }
-
-      // Calculate order total
-      const { data: productData } = await supabaseAdmin
-        .from("products")
-        .select("id, price_cents")
-        .in(
-          "id",
-          items.map((i) => i.product_id)
-        );
-
-      let total = 0;
-      if (productData) {
-        for (const item of items) {
-          const prod = productData.find((p: { id: string }) => p.id === item.product_id);
-          if (prod) {
-            total += prod.price_cents * (item.quantity || 1);
-          }
-        }
-      }
-
-      // Generate display_id
-      const displayId = `ORD-${Date.now().toString().slice(-6)}`;
-
-      // Create order
-      const { data: order, error } = await supabaseAdmin.from("orders").insert({
-        business_id: businessId,
-        display_id: displayId,
-        customer_name: customerName,
-        channel_type: channel as "whatsapp" | "instagram" | "messenger" | "web",
-        total_cents: total,
-        status: "draft",
-      });
-
-      if (error) {
-        return {
-          success: false,
-          error: error.message,
-        };
-      }
-
-      // Create order items
-      if (order && order.length > 0) {
-        const orderId = order[0].id;
-        const orderItems = items.map((item) => ({
-          order_id: orderId,
-          product_id: item.product_id || null,
-          name: "Item",
-          quantity: item.quantity || 1,
-          price_cents: 0,
-        }));
-
-        await supabaseAdmin.from("order_items").insert(orderItems);
-      }
-
-      return {
-        success: true,
-        result: {
-          orderId: order?.[0]?.id,
-          displayId,
-          total: (total / 100).toFixed(2),
-        },
-      };
-    }
-
-    return {
-      success: false,
-      error: `Unknown tool: ${toolName}`,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
-    };
-  }
+  ok?: boolean;
 }
 
-// ============================================================================
-// Reliability-first AI reply with Gemini multi-model fallback + a direct
-// Supabase catalog lookup. This guarantees that a product question like
-// "do you have a blue ceramic mug?" ALWAYS gets a real, grounded answer even
-// when every Gemini model is rate-limited/"busy" or no API key is configured.
-// ============================================================================
-
-interface CatalogMatch {
+export interface CatalogMatch {
   id: string;
   name: string;
   sku: string;
@@ -355,188 +52,447 @@ export interface CustomerReply {
   text: string;
   source: "gemini" | "catalog" | "error";
   model?: string;
-  toolsUsed: Array<{ name: string; params: Record<string, unknown> }>;
+  toolsUsed: ToolCall[];
   matchedProducts: CatalogMatch[];
 }
 
-const GEMINI_MODELS = Array.from(
-  new Set(
-    [
-      process.env.NEXT_PUBLIC_GEMINI_MODEL || process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-    ].filter(Boolean) as string[]
-  )
-);
-
-/**
- * Call a single Gemini model over the REST endpoint. Returns the generated
- * text, or null when the model is unavailable / rate-limited / returns empty.
- */
-async function callGeminiModel(
-  model: string,
-  apiKey: string,
-  systemPrompt: string,
-  contents: Array<{ role: "user" | "model"; text: string }>
-): Promise<string | null> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: contents.map((c) => ({ role: c.role, parts: [{ text: c.text }] })),
-        generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
-      }),
-    }
-  );
-
-  if (!res.ok) return null;
-
-  const data: { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } =
-    await res.json();
-  const text = data.candidates?.[0]?.content?.parts
-    ?.map((p) => p.text || "")
-    .filter(Boolean)
-    .join("\n");
-
-  return text && text.trim() ? text.trim() : null;
+export interface ReplyOptions {
+  channelType?: ChannelType;
+  conversationId?: string | null;
+  customerName?: string;
+  /** Set false to answer without offering to place orders. */
+  allowTools?: boolean;
 }
 
-/**
- * Direct Supabase catalog lookup: tokenize the customer query and score every
- * active product by how many of its name/sku/description tokens match.
- */
-async function searchCatalog(businessId: string, query: string): Promise<CatalogMatch[]> {
+// ---------------------------------------------------------------------------
+// Gemini wire types
+// ---------------------------------------------------------------------------
+
+interface GeminiPart {
+  text?: string;
+  functionCall?: { name?: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+}
+
+interface GeminiContent {
+  role: "user" | "model";
+  parts: GeminiPart[];
+}
+
+// ---------------------------------------------------------------------------
+// Tool declarations
+// ---------------------------------------------------------------------------
+
+const TOOL_DECLARATIONS = [
+  {
+    functionDeclarations: [
+      {
+        name: "search_products",
+        description:
+          "Search the catalog by name, SKU or description. Use this before answering any question about what is available, what something costs, or whether an item is in stock.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: { type: "STRING", description: "What the customer is looking for" },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "create_order",
+        description:
+          "Place an order once the customer has clearly confirmed exactly what they want. Never call this speculatively — only after an explicit yes. Returns an order number and, when payments are configured, a checkout link to give the customer.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            customer_name: { type: "STRING", description: "The customer's name" },
+            items: {
+              type: "ARRAY",
+              description: "The products to order",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  product_id: {
+                    type: "STRING",
+                    description: "The product's id, exactly as returned by search_products",
+                  },
+                  quantity: { type: "INTEGER", description: "How many" },
+                },
+                required: ["product_id", "quantity"],
+              },
+            },
+          },
+          required: ["customer_name", "items"],
+        },
+      },
+    ],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Catalog helpers
+// ---------------------------------------------------------------------------
+
+/** Strip PostgREST filter metacharacters so a query can't inject clauses. */
+function sanitizeFilter(term: string): string {
+  return term.replace(/[(),*"\\]/g, " ").trim();
+}
+
+async function searchCatalog(businessId: string, query: string, limit = 5): Promise<CatalogMatch[]> {
   if (!businessId) return [];
+  const term = sanitizeFilter(query || "");
+  if (!term) return [];
 
   const { data, error } = await supabaseAdmin
     .from("products")
     .select("id, name, sku, price_cents, currency, description")
     .eq("business_id", businessId)
     .eq("is_active", true)
-    .limit(500);
+    .or(`name.ilike.%${term}%,sku.ilike.%${term}%,description.ilike.%${term}%`)
+    .limit(limit);
 
-  if (error || !data || data.length === 0) return [];
-
-  const tokens = (query || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-
-  if (tokens.length === 0) return [];
-
-  return data
-    .map((p: CatalogMatch) => {
-      const haystack = `${p.name} ${p.sku} ${p.description ?? ""}`.toLowerCase();
-      const matched = tokens.filter((t) => haystack.includes(t)).length;
-      return { p, matched, score: matched / tokens.length };
-    })
-    .filter((r: { matched: number }) => r.matched > 0)
-    .sort(
-      (a: { score: number; matched: number }, b: { score: number; matched: number }) =>
-        b.score - a.score || b.matched - a.matched
-    )
-    .slice(0, 3)
-    .map((r: { p: CatalogMatch }) => r.p);
+  if (error) {
+    console.error("searchCatalog failed:", error);
+    return [];
+  }
+  return (data ?? []) as CatalogMatch[];
 }
 
+function formatPrice(cents: number, currency: string): string {
+  return `${(cents / 100).toFixed(2)} ${currency || "USD"}`;
+}
 
 function formatCatalogAnswer(matches: CatalogMatch[]): string {
   if (matches.length === 0) {
-    return "I couldn't find that item in our catalog right now. Could you describe it differently, or check back soon?";
+    return "I couldn't find that in our catalog. Could you describe it a different way, or tell me roughly what you're after?";
+  }
+  const lines = matches.map(
+    (p) =>
+      `• ${p.name} — ${formatPrice(p.price_cents, p.currency)}${p.description ? ` (${p.description})` : ""}`
+  );
+  return `Here's what I found:\n\n${lines.join("\n")}\n\nWould you like me to put an order together?`;
+}
+
+// ---------------------------------------------------------------------------
+// Tool execution
+// ---------------------------------------------------------------------------
+
+export async function processToolCall(
+  businessId: string,
+  toolName: string,
+  params: Record<string, unknown>,
+  options: ReplyOptions = {}
+): Promise<{ success: boolean; result?: unknown; error?: string }> {
+  try {
+    if (toolName === "search_products" || toolName === "get_product_price") {
+      const query = String(params.query ?? params.product_query ?? "");
+      const matches = await searchCatalog(businessId, query);
+
+      if (matches.length === 0) {
+        return { success: true, result: { found: 0, products: [], note: "No match in the catalog." } };
+      }
+
+      return {
+        success: true,
+        result: {
+          found: matches.length,
+          products: matches.map((p) => ({
+            product_id: p.id,
+            name: p.name,
+            sku: p.sku,
+            price: formatPrice(p.price_cents, p.currency),
+            price_cents: p.price_cents,
+            currency: p.currency,
+            description: p.description ?? undefined,
+          })),
+        },
+      };
+    }
+
+    if (toolName === "create_order") {
+      const items = Array.isArray(params.items)
+        ? (params.items as Array<{ product_id: string; quantity: number }>)
+        : [];
+
+      const created = await createOrder(supabaseAdmin, {
+        businessId,
+        customerName: String(params.customer_name || options.customerName || "Guest"),
+        channelType: options.channelType ?? "web",
+        conversationId: options.conversationId ?? null,
+        items,
+        createPaymentLink: true,
+      });
+
+      if (!created.ok) {
+        return { success: false, error: created.error };
+      }
+
+      return {
+        success: true,
+        result: {
+          order_number: created.order.display_id,
+          total: formatPrice(created.order.total_cents, created.order.currency),
+          payment_link: created.order.payment_link,
+          items: created.order.items.map((i) => `${i.quantity}x ${i.name}`),
+          note: created.order.payment_link
+            ? "Give the customer the payment link so they can complete checkout."
+            : "No payment link is available; tell the customer someone will follow up to arrange payment.",
+        },
+      };
+    }
+
+    return { success: false, error: `Unknown tool: ${toolName}` };
+  } catch (error) {
+    console.error(`Tool ${toolName} threw:`, error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "The tool failed.",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt
+// ---------------------------------------------------------------------------
+
+async function buildSystemPrompt(businessId: string): Promise<string> {
+  const [{ data: settings }, { data: products }] = await Promise.all([
+    supabaseAdmin.from("agent_settings").select("*").eq("business_id", businessId).maybeSingle(),
+    supabaseAdmin
+      .from("products")
+      .select("name, price_cents, currency, description")
+      .eq("business_id", businessId)
+      .eq("is_active", true)
+      .limit(CATALOG_CONTEXT_LIMIT),
+  ]);
+
+  const catalog =
+    products && products.length > 0
+      ? products
+          .map(
+            (p: { name: string; price_cents: number; currency: string; description?: string | null }) =>
+              `${p.name}: ${formatPrice(p.price_cents, p.currency)}${p.description ? ` - ${p.description}` : ""}`
+          )
+          .join("\n")
+      : "(catalog is empty)";
+
+  const greeting = settings?.greeting_message || "Hi! How can I help you today?";
+  const tone = settings?.formality || "Neutral";
+  const emoji = settings?.emoji_enabled
+    ? "You may use the occasional emoji."
+    : "Do not use emojis.";
+
+  return `You are a customer service assistant for an online shop, talking to a customer in a chat window.
+
+Your opening line, if you need one: "${greeting}"
+Tone: ${tone}. ${emoji}
+
+A sample of the catalog (not the whole thing):
+${catalog}
+
+How to work:
+- Use search_products whenever the customer asks about an item, a price, or availability. The sample above may be incomplete or stale — the tool is the source of truth.
+- Quote only prices the tool returned. Never invent or estimate a price.
+- Before ordering, confirm the exact item and quantity in your own words and wait for a clear yes.
+- Only then call create_order, using the product_id values search_products gave you.
+- After an order is placed, tell the customer the order number and give them the payment link verbatim if there is one.
+- If a tool reports an error, say plainly what went wrong and offer to pass them to a human. Never pretend an order succeeded.
+- Keep replies short and natural — this is a chat, not an email.`;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini call
+// ---------------------------------------------------------------------------
+
+async function callGemini(
+  model: string,
+  apiKey: string,
+  systemPrompt: string,
+  contents: GeminiContent[],
+  useTools: boolean
+): Promise<GeminiPart[] | null> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Header, not ?key= — query strings end up in proxy and error logs.
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents,
+        ...(useTools ? { tools: TOOL_DECLARATIONS } : {}),
+        generationConfig: { temperature: 0.6, maxOutputTokens: 800 },
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    console.warn(`Gemini ${model} returned ${res.status}`);
+    return null;
   }
 
-  const lines = matches.map((p) => {
-    const price = `${(p.price_cents / 100).toFixed(2)} ${p.currency || "USD"}`;
-    return `• ${p.name} — ${price}${p.description ? ` (${p.description})` : ""}`;
-  });
+  const data = (await res.json()) as {
+    candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
+  };
 
-  return `Here's what I found in our catalog:\n\n${lines.join("\n")}\n\nWould you like me to help you place an order?`;
+  return data.candidates?.[0]?.content?.parts ?? null;
 }
 
 /**
- * Generate a customer reply using the same brain the webhooks and the AI chat
- * widget rely on. Always returns a text reply (never throws), so "busy"
- * errors can't leak through to an end customer.
+ * Run one model through the full tool loop: ask, run any tools it calls, hand
+ * the results back, and repeat until it produces prose (or we hit the cap).
+ * Returns null so the caller can fall through to the next model.
+ */
+async function runToolLoop(
+  model: string,
+  apiKey: string,
+  systemPrompt: string,
+  contents: GeminiContent[],
+  businessId: string,
+  options: ReplyOptions,
+  toolsUsed: ToolCall[]
+): Promise<string | null> {
+  const useTools = options.allowTools !== false;
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    // On the last round drop the tools, forcing a prose answer rather than
+    // another call we have no budget to run.
+    const parts = await callGemini(
+      model,
+      apiKey,
+      systemPrompt,
+      contents,
+      useTools && round < MAX_TOOL_ROUNDS
+    );
+    if (!parts) return null;
+
+    const calls = parts.filter((p) => p.functionCall?.name);
+    const text = parts
+      .map((p) => p.text || "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    if (calls.length === 0) {
+      return text || null;
+    }
+
+    // Record the model's turn verbatim, then answer each call.
+    contents.push({ role: "model", parts: calls });
+
+    const responseParts: GeminiPart[] = [];
+    for (const part of calls) {
+      const name = part.functionCall!.name!;
+      const args = part.functionCall!.args ?? {};
+      const outcome = await processToolCall(businessId, name, args, options);
+
+      toolsUsed.push({
+        name,
+        params: args,
+        ok: outcome.success,
+        result: outcome.success ? outcome.result : outcome.error,
+      });
+
+      responseParts.push({
+        functionResponse: {
+          name,
+          response: outcome.success
+            ? { result: outcome.result }
+            : { error: outcome.error ?? "The tool failed." },
+        },
+      });
+    }
+
+    contents.push({ role: "user", parts: responseParts });
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/**
+ * Produce a reply for a customer message. Never throws: a missing API key, a
+ * rate-limited model or a failing tool all degrade to something sensible
+ * rather than 500ing the webhook and triggering provider retries.
+ *
+ * Order of attack: each Gemini model in turn (with tools), then a direct
+ * catalog lookup, then a plain apology.
  */
 export async function generateCustomerReply(
   businessId: string,
   customerMessage: string,
-  history: MessageHistory[] = []
+  history: MessageHistory[] = [],
+  options: ReplyOptions = {}
 ): Promise<CustomerReply> {
-  // Build Gemini contents (alternating user/model, starting with user).
-  const contents: Array<{ role: "user" | "model"; text: string }> = [];
-  for (const m of history) {
-    contents.push({
-      role: m.sender === "customer" ? "user" : "model",
-      text: m.text,
-    });
-  }
-  contents.push({ role: "user", text: customerMessage });
-
-  // Product context for the system prompt.
-  const { data: contextProducts, error: contextError } = await supabaseAdmin
-    .from("products")
-    .select("name, price_cents, currency, description")
-    .eq("business_id", businessId)
-    .eq("is_active", true)
-    .limit(20);
-
-  const productContext =
-    !contextError && contextProducts && contextProducts.length > 0
-      ? contextProducts
-          .map(
-            (p: { name: string; price_cents: number; currency: string; description?: string | null }) =>
-              `${p.name}: ${(p.price_cents / 100).toFixed(2)} ${p.currency}${p.description ? ` - ${p.description}` : ""}`
-          )
-          .join("\n")
-      : "No products available";
-
-  const systemPrompt = `You are a helpful e-commerce customer service AI assistant.
-Available Products:
-${productContext}
-
-Guidelines:
-- Be concise and natural.
-- When customers ask about products, reference the available catalog above.
-- If you cannot find a product in the catalog, say you'll check again and offer to help further — never claim a product is unavailable without checking.
-- Maintain context from conversation history.`;
-
-  // 1) Try Gemini across multiple models (fall back when one is "busy").
+  const toolsUsed: ToolCall[] = [];
   const apiKey = process.env.GEMINI_API_KEY;
-  for (const model of GEMINI_MODELS) {
-    if (!apiKey) break;
+
+  if (apiKey && businessId) {
+    let systemPrompt: string;
     try {
-      const text = await callGeminiModel(model, apiKey, systemPrompt, contents);
-      if (text) {
-        return { text, source: "gemini", model, toolsUsed: [], matchedProducts: [] };
+      systemPrompt = await buildSystemPrompt(businessId);
+    } catch (error) {
+      console.error("Failed to build system prompt:", error);
+      systemPrompt = "You are a helpful customer service assistant for an online shop.";
+    }
+
+    for (const model of GEMINI_MODELS) {
+      // Fresh contents per model: a half-finished tool exchange from a model
+      // that died mid-loop would confuse the next one.
+      const contents: GeminiContent[] = [
+        ...history
+          .filter((m) => m.text?.trim())
+          .map((m) => ({
+            role: m.sender === "customer" ? ("user" as const) : ("model" as const),
+            parts: [{ text: m.text }],
+          })),
+        { role: "user" as const, parts: [{ text: customerMessage }] },
+      ];
+
+      try {
+        const text = await runToolLoop(
+          model,
+          apiKey,
+          systemPrompt,
+          contents,
+          businessId,
+          options,
+          toolsUsed
+        );
+        if (text) {
+          return { text, source: "gemini", model, toolsUsed, matchedProducts: [] };
+        }
+      } catch (error) {
+        console.warn(`Gemini ${model} failed, trying the next model:`, error);
       }
-    } catch {
-      // Model down or rate-limited — try the next one.
     }
   }
 
-  // 2) Direct Supabase catalog lookup so product questions NEVER hit a
-  //    "busy" wall even when every Gemini model is unavailable.
-  const matches = await searchCatalog(businessId, customerMessage);
+  // Fallback: answer straight from the catalog so a product question still
+  // gets a real answer when every model is unavailable.
+  const matches = await searchCatalog(businessId, customerMessage, 3);
   if (matches.length > 0) {
     return {
       text: formatCatalogAnswer(matches),
       source: "catalog",
-      toolsUsed: [],
+      toolsUsed,
       matchedProducts: matches,
     };
   }
 
-  // 3) Last-resort graceful message (never "busy"/error-ridden).
   return {
-    text: "I'm having trouble reaching our AI right now. Please try again in a moment, or ask to speak with a human agent.",
+    text: "I'm having trouble reaching our system right now. Please try again in a moment, or ask for a human and someone will pick this up.",
     source: "error",
-    toolsUsed: [],
+    toolsUsed,
     matchedProducts: [],
   };
 }
+
+/** @deprecated Use generateCustomerReply — this exists so older imports keep working. */
+export const getAIReply = generateCustomerReply;

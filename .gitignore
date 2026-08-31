@@ -5,7 +5,6 @@
 
 # ---- Dependencies ----
 node_modules/
-server/node_modules/
 
 # ---- Next.js / build output ----
 .next/
@@ -37,13 +36,9 @@ next-out.log
 .env.*.local
 .env.*.production
 .env.*.development
-server/.env
-server/.env.*
 # Un-ignore the example templates (safe to commit — placeholders only)
 !.env.example
 !.env.template
-!server/.env.example
-!server/.env.template
 
 # ---- Private keys & credentials (saved on disk, never pushed) ----
 *.pem

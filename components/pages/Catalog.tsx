@@ -27,7 +27,14 @@ export default function Catalog() {
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      uploadProducts.mutate(file);
+      uploadProducts.mutate(file, {
+        onSuccess: (r) =>
+          say(
+            `Imported ${r.imported} product${r.imported === 1 ? "" : "s"}` +
+              (r.skipped ? ` · skipped ${r.skipped} row(s) with no name` : "")
+          ),
+        onError: (err) => say(err instanceof Error ? err.message : "Upload failed"),
+      });
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }

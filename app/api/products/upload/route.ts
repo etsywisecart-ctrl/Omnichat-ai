@@ -1,114 +1,88 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase/server";
+import { resolveBusiness, UNAUTHORIZED } from "@/lib/supabase/auth";
+import { parseCSV } from "@/lib/products/csv";
 
-interface CSVProduct {
-  name: string;
-  sku: string;
-  price_cents: number;
-  currency?: string;
-  description?: string;
-}
-
-function parseCSV(csv: string): CSVProduct[] {
-  const lines = csv.trim().split("\n");
-  if (lines.length < 2) {
-    return [];
-  }
-
-  const headers = lines[0].split(",").map((h) => h.trim().toLowerCase());
-  const products: CSVProduct[] = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-
-    const values = line.split(",").map((v) => v.trim());
-    const row: Record<string, string> = {};
-
-    headers.forEach((header, index) => {
-      row[header] = values[index] || "";
-    });
-
-    // Parse product - expect: name, sku, price (in cents or dollars), [currency], [description]
-    if (!row.name || !row.sku) continue;
-
-    let priceCents = 0;
-    if (row.price) {
-      const priceNum = parseFloat(row.price);
-      // If price looks like cents (>100), use as-is; otherwise assume dollars and multiply by 100
-      priceCents = priceNum > 100 ? Math.round(priceNum) : Math.round(priceNum * 100);
-    }
-
-    products.push({
-      name: row.name,
-      sku: row.sku,
-      price_cents: priceCents,
-      currency: row.currency || "USD",
-      description: row.description || undefined,
-    });
-  }
-
-  return products;
-}
+export const runtime = "nodejs";
 
 /**
  * POST /api/products/upload
- * Upload a CSV file and insert products
- * Expected format: name, sku, price, [currency], [description]
+ * Import a product CSV into the signed-in user's catalog.
+ *
+ * Columns: name (required), price or price_cents (required), sku, currency,
+ * description. The business is taken from the caller's session — never from
+ * the request body — so one tenant can't write into another's catalog.
  */
 export async function POST(request: NextRequest) {
+  const ctx = await resolveBusiness(request);
+  if (!ctx) return NextResponse.json(UNAUTHORIZED, { status: 401 });
+
   try {
     const formData = await request.formData();
-    const file = formData.get("file") as File;
-    const businessId = formData.get("business_id") as string;
+    const file = formData.get("file");
 
-    if (!file || !businessId) {
+    if (!file || typeof file === "string") {
       return NextResponse.json(
-        { error: "Missing file or business_id" },
+        { error: "no_file", message: "Attach a CSV file to upload." },
         { status: 400 }
       );
     }
 
     const csv = await file.text();
-    const products = parseCSV(csv);
+    const { products, skipped } = parseCSV(csv);
 
     if (products.length === 0) {
       return NextResponse.json(
-        { error: "No valid products found in CSV" },
+        {
+          error: "no_valid_rows",
+          message:
+            "No usable rows found. Each row needs a name and a price (or price_cents).",
+        },
         { status: 400 }
       );
     }
 
-    // Insert products with business_id
-    const { data: inserted, error } = await supabaseAdmin
+    // Last row wins on a repeated SKU. Without this, Postgres rejects the whole
+    // batch with "ON CONFLICT DO UPDATE command cannot affect row a second time".
+    const bySku = new Map<string, (typeof products)[number]>();
+    for (const p of products) bySku.set(p.sku, p);
+    const unique = [...bySku.values()];
+
+    const { data: inserted, error } = await ctx.supabase
       .from("products")
-      .insert(
-        products.map((p) => ({
-          business_id: businessId,
+      .upsert(
+        unique.map((p) => ({
+          business_id: ctx.businessId,
           name: p.name,
           sku: p.sku,
+          description: p.description ?? null,
           price_cents: p.price_cents,
-          currency: p.currency || "USD",
-          description: p.description,
+          currency: p.currency,
           source: "csv",
           is_active: true,
-        }))
+          updated_at: new Date().toISOString(),
+        })),
+        { onConflict: "business_id,sku", ignoreDuplicates: false }
       )
       .select();
 
     if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
+      console.error("CSV upload insert failed:", error);
+      return NextResponse.json(
+        { error: "insert_failed", message: error.message },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
       success: true,
-      inserted: inserted?.length || 0,
+      inserted: inserted?.length ?? 0,
+      skipped: skipped + (products.length - unique.length),
       products: inserted,
     });
   } catch (error) {
     console.error("CSV upload error:", error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unknown error" },
+      { error: "server_error", message: "Couldn't read that CSV file." },
       { status: 500 }
     );
   }
