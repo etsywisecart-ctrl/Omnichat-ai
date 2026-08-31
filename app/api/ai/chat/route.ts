@@ -44,6 +44,7 @@ export async function POST(request: NextRequest) {
       model: reply.model ?? null,
       toolsUsed: reply.toolsUsed,
       matchedProducts: reply.matchedProducts,
+      reason: reply.reason ?? null,
     });
   } catch (error) {
     console.error("AI chat error:", error);

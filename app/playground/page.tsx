@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useSession } from "@/hooks/useSession";
 import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
 import { useDashboardStore, isDark } from "@/store/useDashboardStore";
+import { supabase } from "@/lib/supabase/client";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
 
 interface Turn {
@@ -14,6 +15,15 @@ interface Turn {
   source?: string;
   model?: string | null;
   tools?: Array<{ name: string; ok?: boolean }>;
+  /** Operator-facing explanation of a fallback, e.g. a missing API key. */
+  reason?: string | null;
+}
+
+interface Diagnostics {
+  healthy: boolean;
+  summary: string;
+  checks: Array<{ name: string; ok: boolean; detail: string; fix?: string }>;
+  reminder: string;
 }
 
 const SOURCE_LABEL: Record<string, { text: string; cls: string }> = {
@@ -40,7 +50,33 @@ export default function Playground() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [diag, setDiag] = useState<Diagnostics | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagError, setDiagError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+
+  // The diagnostics endpoint needs the caller's token, so it can't just be
+  // opened in the address bar. Running it from here keeps it one click away.
+  const runDiagnostics = async () => {
+    setDiagBusy(true);
+    setDiagError(null);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("Sign in first");
+
+      const res = await fetch("/api/diagnostics", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(payload?.message ?? `Diagnostics returned ${res.status}`);
+      setDiag(payload as Diagnostics);
+    } catch (err) {
+      setDiagError(err instanceof Error ? err.message : "Couldn't run the check");
+    } finally {
+      setDiagBusy(false);
+    }
+  };
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -78,6 +114,7 @@ export default function Playground() {
           source: data?.source,
           model: data?.model,
           tools: data?.toolsUsed,
+          reason: data?.reason,
         },
       ]);
     } catch (err) {
@@ -122,6 +159,43 @@ export default function Playground() {
         )}
         {session && !businessId && <NotConnectedNotice />}
 
+        <div className="card" style={{ marginTop: 12, padding: 14 }}>
+          <div className="fx ac gap8 wrap">
+            <button className="btn" onClick={runDiagnostics} disabled={diagBusy || !session}>
+              {diagBusy ? "Checking…" : "Check setup"}
+            </button>
+            <span className="mut fs12">
+              Reports which keys are actually working, so a silent AI resolves to one named setting.
+            </span>
+          </div>
+
+          {diagError && (
+            <div className="mut fs12" style={{ color: "var(--err)", marginTop: 10 }}>
+              {diagError}
+            </div>
+          )}
+
+          {diag && (
+            <div style={{ marginTop: 12 }}>
+              <div className={diag.healthy ? "bdg ok" : "bdg err"}>{diag.summary}</div>
+              <ul className="mut fs12" style={{ marginTop: 10, paddingLeft: 18 }}>
+                {diag.checks.map((c) => (
+                  <li key={c.name} style={{ marginBottom: 6 }}>
+                    <span style={{ marginRight: 6 }}>{c.ok ? "✓" : "✕"}</span>
+                    <strong>{c.name}</strong> — {c.detail}
+                    {c.fix && (
+                      <div style={{ marginTop: 2 }}>
+                        <em>Fix: {c.fix}</em>
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <p className="mut fs12">{diag.reminder}</p>
+            </div>
+          )}
+        </div>
+
         <div className="card" style={{ marginTop: 12 }}>
           <div className="mlist" style={{ minHeight: 320, maxHeight: 460, overflow: "auto" }}>
             {turns.length === 0 && (
@@ -152,6 +226,11 @@ export default function Playground() {
                       </span>
                     ))}
                   </div>
+                  {t.reason && (
+                    <div className="mmeta mut fs12" style={{ maxWidth: 460 }}>
+                      {t.reason}
+                    </div>
+                  )}
                 </div>
               );
             })}

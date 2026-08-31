@@ -1,4 +1,4 @@
-import { supabaseAdmin } from "@/lib/supabase/server";
+import { supabaseAdmin, serviceRoleKeyProblem } from "@/lib/supabase/server";
 import { createOrder, type ChannelType } from "@/lib/orders/create";
 
 // ============================================================================
@@ -54,6 +54,13 @@ export interface CustomerReply {
   model?: string;
   toolsUsed: ToolCall[];
   matchedProducts: CatalogMatch[];
+  /**
+   * Why the answer came from where it did — for operators, never shown to a
+   * customer. Set whenever Gemini was skipped or the catalog was unreachable,
+   * so "the bot isn't answering" resolves to one concrete missing setting
+   * instead of a screenshot-reading session.
+   */
+  reason?: string;
 }
 
 export interface ReplyOptions {
@@ -138,10 +145,24 @@ function sanitizeFilter(term: string): string {
   return term.replace(/[(),*"\\]/g, " ").trim();
 }
 
-async function searchCatalog(businessId: string, query: string, limit = 5): Promise<CatalogMatch[]> {
-  if (!businessId) return [];
+/**
+ * Look up products, reporting *why* nothing came back.
+ *
+ * "No such product" and "the database rejected our key" produce the same empty
+ * array, and telling a customer we can't find their mug when the real problem is
+ * a missing environment variable sends everyone hunting in the wrong place.
+ */
+async function searchCatalog(
+  businessId: string,
+  query: string,
+  limit = 5
+): Promise<{ matches: CatalogMatch[]; error: string | null }> {
+  const keyProblem = serviceRoleKeyProblem();
+  if (keyProblem) return { matches: [], error: keyProblem };
+
+  if (!businessId) return { matches: [], error: "No business id was supplied with the message." };
   const term = sanitizeFilter(query || "");
-  if (!term) return [];
+  if (!term) return { matches: [], error: null };
 
   const { data, error } = await supabaseAdmin
     .from("products")
@@ -153,9 +174,9 @@ async function searchCatalog(businessId: string, query: string, limit = 5): Prom
 
   if (error) {
     console.error("searchCatalog failed:", error);
-    return [];
+    return { matches: [], error: `Catalog lookup failed: ${error.message}` };
   }
-  return (data ?? []) as CatalogMatch[];
+  return { matches: (data ?? []) as CatalogMatch[], error: null };
 }
 
 function formatPrice(cents: number, currency: string): string {
@@ -186,7 +207,11 @@ export async function processToolCall(
   try {
     if (toolName === "search_products" || toolName === "get_product_price") {
       const query = String(params.query ?? params.product_query ?? "");
-      const matches = await searchCatalog(businessId, query);
+      const { matches, error: catalogError } = await searchCatalog(businessId, query);
+
+      if (catalogError) {
+        return { success: false, error: catalogError };
+      }
 
       if (matches.length === 0) {
         return { success: true, result: { found: 0, products: [], note: "No match in the catalog." } };
@@ -432,6 +457,16 @@ export async function generateCustomerReply(
 ): Promise<CustomerReply> {
   const toolsUsed: ToolCall[] = [];
   const apiKey = process.env.GEMINI_API_KEY;
+  const reasons: string[] = [];
+
+  if (!apiKey) {
+    reasons.push(
+      "GEMINI_API_KEY is not set, so no model was contacted. Add it in your hosting environment and redeploy."
+    );
+  }
+  if (!businessId) {
+    reasons.push("No business id reached the AI, so it had no catalog to answer from.");
+  }
 
   if (apiKey && businessId) {
     let systemPrompt: string;
@@ -470,19 +505,35 @@ export async function generateCustomerReply(
         }
       } catch (error) {
         console.warn(`Gemini ${model} failed, trying the next model:`, error);
+        reasons.push(`${model}: ${error instanceof Error ? error.message : "failed"}`);
       }
     }
   }
 
   // Fallback: answer straight from the catalog so a product question still
   // gets a real answer when every model is unavailable.
-  const matches = await searchCatalog(businessId, customerMessage, 3);
+  const { matches, error: catalogError } = await searchCatalog(businessId, customerMessage, 3);
+  if (catalogError) reasons.push(catalogError);
+
   if (matches.length > 0) {
     return {
       text: formatCatalogAnswer(matches),
       source: "catalog",
       toolsUsed,
       matchedProducts: matches,
+      reason: reasons.join(" · ") || undefined,
+    };
+  }
+
+  // The catalog answered and simply held nothing matching. That is a normal
+  // conversation, not a broken deployment, so say so plainly.
+  if (!catalogError) {
+    return {
+      text: formatCatalogAnswer([]),
+      source: "catalog",
+      toolsUsed,
+      matchedProducts: [],
+      reason: reasons.join(" · ") || undefined,
     };
   }
 
@@ -491,6 +542,7 @@ export async function generateCustomerReply(
     source: "error",
     toolsUsed,
     matchedProducts: [],
+    reason: reasons.join(" · ") || undefined,
   };
 }
 
