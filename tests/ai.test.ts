@@ -402,3 +402,117 @@ describe("surviving a model retirement", () => {
     );
   });
 });
+
+describe("running out of quota", () => {
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  /** Google's real 429 body, shape and prose intact. */
+  const QUOTA_429 = {
+    error: {
+      message:
+        "You exceeded your current quota, please check your plan and billing details. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.6-flash Please retry in 18.08755195s.",
+      details: [
+        { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "18s" },
+      ],
+    },
+  };
+
+  test("does not spend the rest of the allowance hunting for another model", async () => {
+    let generateCalls = 0;
+    let listingCalls = 0;
+
+    globalThis.fetch = (async (url: unknown) => {
+      const href = String(url);
+      if (href.includes(":generateContent")) {
+        generateCalls++;
+        return { ok: false, status: 429, json: async () => QUOTA_429 };
+      }
+      if (href.includes("generativelanguage")) {
+        listingCalls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: [
+              { name: "models/gemini-9.9-flash", supportedGenerationMethods: ["generateContent"] },
+            ],
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+    }) as unknown as typeof fetch;
+
+    const { generateCustomerReply, GEMINI_MODELS } = await import("@/lib/ai/gemini");
+    const reply = await generateCustomerReply("biz-1", "hello?", []);
+
+    // Every model on a key shares one free-tier bucket. Trying more of them
+    // during a rate limit spends the allowance real customers need.
+    assert.equal(generateCalls, GEMINI_MODELS.length, "must not try extra models");
+    assert.equal(listingCalls, 0, "must not even ask for the model list");
+  });
+
+  test("says how long to wait, in words a shop owner can act on", async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      if (String(url).includes(":generateContent")) {
+        return { ok: false, status: 429, json: async () => QUOTA_429 };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+    }) as unknown as typeof fetch;
+
+    const { generateCustomerReply } = await import("@/lib/ai/gemini");
+    const reply = await generateCustomerReply("biz-1", "hello?", []);
+
+    assert.match(reply.reason!, /rate-limited by Google's free tier/);
+    assert.match(reply.reason!, /20 requests\/minute/);
+    assert.match(reply.reason!, /18s/);
+    // Waiting is the fix; the reason must not send anyone hunting for a setting.
+    assert.match(reply.reason!, /Waiting is the fix/);
+  });
+
+  test("still tries other models when a name is genuinely dead", async () => {
+    const attempted: string[] = [];
+
+    globalThis.fetch = (async (url: unknown) => {
+      const href = String(url);
+      if (href.includes(":generateContent")) {
+        const model = href.split("/models/")[1].split(":")[0];
+        attempted.push(model);
+        if (model === "gemini-9.9-flash") {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "We sell mugs." }] } }],
+            }),
+          };
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({ error: { message: `${model} is not found` } }),
+        };
+      }
+      if (href.includes("generativelanguage")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: [
+              { name: "models/gemini-9.9-flash", supportedGenerationMethods: ["generateContent"] },
+            ],
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+    }) as unknown as typeof fetch;
+
+    const { generateCustomerReply } = await import("@/lib/ai/gemini");
+    const reply = await generateCustomerReply("biz-1", "hi", [], { allowTools: false });
+
+    // A 404 is about this model, not the allowance — recovery is still right.
+    assert.equal(reply.source, "gemini");
+    assert.ok(attempted.includes("gemini-9.9-flash"));
+  });
+});

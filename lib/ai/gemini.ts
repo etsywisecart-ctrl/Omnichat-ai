@@ -53,8 +53,12 @@ export const GEMINI_MODELS = Array.from(
   )
 );
 
-/** How many discovered models to try once every configured one has failed. */
-const MAX_DISCOVERED_MODELS = 3;
+/**
+ * How many discovered models to try once every configured one has failed.
+ * Kept small: each attempt spends the same free-tier allowance the real
+ * customer traffic needs.
+ */
+const MAX_DISCOVERED_MODELS = 2;
 
 /** Model retirements are not hourly; one listing per 10 minutes is plenty. */
 const MODEL_CACHE_MS = 10 * 60 * 1000;
@@ -187,6 +191,58 @@ interface GeminiPart {
   functionResponse?: { name: string; response: Record<string, unknown> };
 }
 
+/**
+ * A failed model call, carrying whether the failure was about *this model* or
+ * about capacity.
+ *
+ * The distinction decides everything downstream. A 404 means the name is dead
+ * and another model is worth trying. A 429 means the key is over its quota —
+ * and since every model shares one free-tier bucket, trying more models spends
+ * the remaining allowance and makes the outage worse. Treating those two the
+ * same is how a single rate limit turned into sixteen requests.
+ */
+class GeminiCallError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterSeconds: number | null = null
+  ) {
+    super(message);
+    this.name = "GeminiCallError";
+  }
+
+  /** Capacity, not configuration: the same request may work in a moment. */
+  get isTransient(): boolean {
+    return this.status === 429 || this.status >= 500;
+  }
+}
+
+/** Google reports a wait both in RetryInfo and in the prose. Take either. */
+function retryAfterFrom(data: GeminiResponse): number | null {
+  const fromDetails = data.error?.details?.find((d) =>
+    String(d["@type"] ?? "").includes("RetryInfo")
+  )?.retryDelay;
+  const raw = fromDetails ?? data.error?.message?.match(/retry in ([\d.]+)s/i)?.[1];
+  const seconds = Number.parseFloat(String(raw ?? "").replace("s", ""));
+  return Number.isFinite(seconds) ? Math.ceil(seconds) : null;
+}
+
+/**
+ * Google's message is accurate and unreadable — three URLs and a metric name.
+ * Lead with the sentence a shop owner can act on, keep the detail behind it.
+ */
+function explainFailure(status: number, message: string, retryAfter: number | null): string {
+  const wait = retryAfter ? ` Try again in about ${retryAfter}s.` : "";
+
+  if (status === 429) {
+    const limit = message.match(/limit:\s*(\d+)/)?.[1];
+    return `rate-limited by Google's free tier${limit ? ` (${limit} requests/minute)` : ""}.${wait}`;
+  }
+  if (status === 503) return `Google says this model is overloaded right now.${wait}`;
+  if (status >= 500) return `Google had a server error (HTTP ${status}).${wait}`;
+  return `HTTP ${status} — ${message}`;
+}
+
 /** The shape of a generateContent response, success or failure. */
 interface GeminiResponse {
   candidates?: Array<{
@@ -194,7 +250,11 @@ interface GeminiResponse {
     finishReason?: string;
   }>;
   promptFeedback?: { blockReason?: string };
-  error?: { message?: string; status?: string };
+  error?: {
+    message?: string;
+    status?: string;
+    details?: Array<{ "@type"?: string; retryDelay?: string }>;
+  };
 }
 
 interface GeminiContent {
@@ -388,6 +448,31 @@ function rankMatches(products: CatalogMatch[], keywords: string[]): CatalogMatch
     .map((entry) => entry.p);
 }
 
+/**
+ * A plain slice of the catalog, for when a search matches nothing.
+ *
+ * "What do you sell?" reduces to no keywords at all — every word in it is a
+ * stopword — so the search honestly finds nothing, and a model told only "no
+ * match" will search again, and again, until it runs out of rounds with no
+ * answer written. Handing it real products ends that loop with a real reply.
+ */
+async function catalogSample(businessId: string, limit = 5): Promise<CatalogMatch[]> {
+  if (!businessId || serviceRoleKeyProblem()) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from("products")
+    .select("id, name, sku, price_cents, currency, description")
+    .eq("business_id", businessId)
+    .eq("is_active", true)
+    .limit(limit);
+
+  if (error) {
+    console.error("catalogSample failed:", error);
+    return [];
+  }
+  return (data ?? []) as CatalogMatch[];
+}
+
 function formatPrice(cents: number, currency: string): string {
   return `${(cents / 100).toFixed(2)} ${currency || "USD"}`;
 }
@@ -423,7 +508,25 @@ export async function processToolCall(
       }
 
       if (matches.length === 0) {
-        return { success: true, result: { found: 0, products: [], note: "No match in the catalog." } };
+        const sample = await catalogSample(businessId);
+        return {
+          success: true,
+          result: {
+            found: 0,
+            products: sample.map((p) => ({
+              product_id: p.id,
+              name: p.name,
+              sku: p.sku,
+              price: formatPrice(p.price_cents, p.currency),
+              price_cents: p.price_cents,
+              currency: p.currency,
+              description: p.description ?? undefined,
+            })),
+            note: sample.length
+              ? "Nothing matched that exact wording. These are real products from the catalog — answer with them rather than searching again."
+              : "The catalog has no active products. Say so; do not search again.",
+          },
+        };
       }
 
       return {
@@ -603,7 +706,12 @@ async function callGemini(
   // caller turns this message into the reason line under the reply.
   if (!res.ok) {
     const detail = data.error?.message || res.statusText || "no detail";
-    throw new Error(`HTTP ${res.status} — ${detail}`);
+    const retryAfter = retryAfterFrom(data);
+    throw new GeminiCallError(
+      explainFailure(res.status, detail, retryAfter),
+      res.status,
+      retryAfter
+    );
   }
 
   const candidate = data.candidates?.[0];
@@ -616,7 +724,9 @@ async function callGemini(
       data.promptFeedback?.blockReason ??
       candidate?.finishReason ??
       "returned no content";
-    throw new Error(`answered with nothing (${why})`);
+    // A 200 with no parts is the model's own doing, not a capacity problem, so
+    // this is deliberately not transient: another model is worth trying.
+    throw new GeminiCallError(`answered with nothing (${why})`, 200);
   }
 
   return parts;
@@ -657,8 +767,13 @@ async function runToolLoop(
       .join("\n")
       .trim();
 
-    if (calls.length === 0) {
-      if (!text) throw new Error("replied with an empty message");
+    // On the final round the tools are gone, so any prose it produced is the
+    // answer — even if it also emitted a call we are no longer able to run.
+    // Throwing that text away is how a model that had an answer ended up
+    // reported as "still calling tools and never wrote an answer".
+    const lastRound = round === MAX_TOOL_ROUNDS || !useTools;
+    if (calls.length === 0 || (lastRound && text)) {
+      if (!text) throw new GeminiCallError("replied with an empty message", 200);
       return text;
     }
 
@@ -691,8 +806,9 @@ async function runToolLoop(
     contents.push({ role: "user", parts: responseParts });
   }
 
-  throw new Error(
-    `was still calling tools after ${MAX_TOOL_ROUNDS} rounds and never wrote an answer`
+  throw new GeminiCallError(
+    `kept asking for tools after ${MAX_TOOL_ROUNDS} rounds and never wrote an answer`,
+    200
   );
 }
 
@@ -737,6 +853,8 @@ export async function generateCustomerReply(
     }
 
     const tried = new Set<string>();
+    // Starts true and only survives if every single failure was about capacity.
+    let allFailuresWereTransient = true;
 
     const tryModel = async (model: string): Promise<CustomerReply | null> => {
       if (tried.has(model)) return null;
@@ -767,6 +885,9 @@ export async function generateCustomerReply(
         return { text, source: "gemini", model, toolsUsed, matchedProducts: [] };
       } catch (error) {
         console.warn(`Gemini ${model} failed, trying the next model:`, error);
+        if (!(error instanceof GeminiCallError) || !error.isTransient) {
+          allFailuresWereTransient = false;
+        }
         reasons.push(`${model}: ${error instanceof Error ? error.message : "failed"}`);
         return null;
       }
@@ -780,15 +901,25 @@ export async function generateCustomerReply(
     // Every configured name failed. The most likely reason by far is that they
     // were retired, so ask Google what this key can actually use rather than
     // answering from the catalog until someone notices and edits the code.
-    const discovered = (await discoverModels(apiKey)).filter((m) => !tried.has(m));
+    // Only when a configured name looks *dead*. Every model on a key draws from
+    // the same free-tier bucket, so answering a rate limit by trying three more
+    // models spends what is left of the allowance and deepens the outage — the
+    // opposite of recovering from it.
+    if (allFailuresWereTransient) {
+      reasons.push(
+        "Every model was busy or over quota, so no others were tried — they draw on the same allowance. Waiting is the fix, not a different model."
+      );
+    } else {
+      const discovered = (await discoverModels(apiKey)).filter((m) => !tried.has(m));
 
-    for (const model of discovered.slice(0, MAX_DISCOVERED_MODELS)) {
-      const reply = await tryModel(model);
-      if (reply) return reply;
-    }
+      for (const model of discovered.slice(0, MAX_DISCOVERED_MODELS)) {
+        const reply = await tryModel(model);
+        if (reply) return reply;
+      }
 
-    if (discovered.length === 0) {
-      reasons.push("Google offered no other usable model for this key.");
+      if (discovered.length === 0) {
+        reasons.push("Google offered no other usable model for this key.");
+      }
     }
   }
 
