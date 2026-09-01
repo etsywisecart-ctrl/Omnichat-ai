@@ -29,6 +29,28 @@ export const dynamic = "force-dynamic";
 /** The question the live test asks. Harmless, and shaped like a real one. */
 const LIVE_PROBE = "Hi, what products do you sell?";
 
+/**
+ * Which build is answering this request.
+ *
+ * Vercel sets the VERCEL_GIT_* variables to the commit it built, so the running
+ * site can name itself instead of being inferred from its behaviour. Without
+ * this, "is my change live?" is answered by hunting for a visible symptom of
+ * the new code — which is only ever a proxy, and reads as "not deployed" for
+ * any change that isn't visible.
+ */
+function buildInfo() {
+  const sha = process.env.VERCEL_GIT_COMMIT_SHA;
+  const message = process.env.VERCEL_GIT_COMMIT_MESSAGE ?? "";
+  return {
+    commit: sha ? sha.slice(0, 7) : "(not a Vercel build)",
+    branch: process.env.VERCEL_GIT_COMMIT_REF ?? "(unknown)",
+    // First line only: commit bodies run to paragraphs.
+    message: message.split("\n")[0].slice(0, 100),
+    builtAt: process.env.BUILD_TIME ?? null,
+    environment: process.env.VERCEL_ENV ?? "development",
+  };
+}
+
 /** `sb_secret_abc…xyz` — enough to spot a wrong key, useless to steal. */
 function shape(value: string | undefined): string {
   if (!value) return "(not set)";
@@ -237,6 +259,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(
     {
       healthy: failing.length === 0,
+      build: buildInfo(),
       summary: failing.length === 0
         ? "Everything is configured correctly."
         : `${failing.length} problem(s): ${failing.map((c) => c.name).join(", ")}`,

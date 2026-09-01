@@ -21,9 +21,31 @@ interface Turn {
 
 interface Diagnostics {
   healthy: boolean;
+  /** Which commit is actually serving this page. */
+  build?: {
+    commit: string;
+    branch: string;
+    message: string;
+    builtAt: string | null;
+    environment: string;
+  };
   summary: string;
   checks: Array<{ name: string; ok: boolean; detail: string; fix?: string }>;
   reminder: string;
+}
+
+/** "3 minutes ago" — a timestamp answers "did my change land?" far slower. */
+function howLongAgo(iso: string | null): string {
+  if (!iso) return "unknown";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms)) return "unknown";
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
 const SOURCE_LABEL: Record<string, { text: string; cls: string }> = {
@@ -194,6 +216,14 @@ export default function Playground() {
 
           {diag && (
             <div style={{ marginTop: 12 }}>
+              {diag.build && (
+                <div className="mut fs12" style={{ marginBottom: 8 }}>
+                  Running commit <strong>{diag.build.commit}</strong> on{" "}
+                  <strong>{diag.build.branch}</strong>, built{" "}
+                  {howLongAgo(diag.build.builtAt)}
+                  {diag.build.message ? ` — “${diag.build.message}”` : ""}
+                </div>
+              )}
               <div className={diag.healthy ? "bdg ok" : "bdg err"}>{diag.summary}</div>
               <ul className="mut fs12" style={{ marginTop: 10, paddingLeft: 18 }}>
                 {diag.checks.map((c) => (
