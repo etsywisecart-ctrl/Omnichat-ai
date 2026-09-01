@@ -22,29 +22,108 @@ const CATALOG_CONTEXT_LIMIT = 20;
 const MAX_OUTPUT_TOKENS = 2048;
 
 /**
- * Whether a model accepts `thinkingConfig`. Sending it to one that doesn't —
- * 2.0 and 1.5 — is a 400 on every request, so this must stay a whitelist.
+ * Whether to *try* `thinkingConfig` on a model. Only 2.5 is known to accept
+ * it, and guessing wider is how a whole model list came to 404. Newer models
+ * may well accept it too — callGemini finds that out by asking, and retries
+ * without the field if Google objects, rather than trusting a list that rots.
  */
 function supportsThinking(model: string): boolean {
-  return /^gemini-(2\.5|3)/.test(model);
+  return /^gemini-2\.5/.test(model);
 }
 
 /**
- * Models tried in order; the next one is used when a model is busy or down.
- * Exported so /api/diagnostics can check these exact names against the key —
- * a retired model name fails every single request while the key itself tests
- * perfectly, and nothing else in the app would ever reveal that.
+ * Models tried first, in order.
+ *
+ * Google retires model names, and afterwards every request 404s while the key
+ * itself still tests perfectly. This app shipped `gemini-2.5-flash`,
+ * `gemini-2.0-flash` and `gemini-1.5-flash`; all three were retired, so every
+ * customer got a catalog fallback while diagnostics cheerfully reported "50
+ * models available". The name below is the replacement Google's own 404 named.
+ *
+ * GEMINI_MODEL overrides it from the environment, so the next retirement is a
+ * Vercel variable rather than a code change — and discoverModels() below means
+ * even that is only needed to pick a *preference*, not to stay working.
  */
 export const GEMINI_MODELS = Array.from(
   new Set(
     [
       process.env.GEMINI_MODEL || process.env.NEXT_PUBLIC_GEMINI_MODEL,
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
+      "gemini-3.6-flash",
     ].filter(Boolean) as string[]
   )
 );
+
+/** How many discovered models to try once every configured one has failed. */
+const MAX_DISCOVERED_MODELS = 3;
+
+/** Model retirements are not hourly; one listing per 10 minutes is plenty. */
+const MODEL_CACHE_MS = 10 * 60 * 1000;
+let discoveryCache: { at: number; models: string[] } | null = null;
+
+/** Names that answer chat, excluding embedding, image, audio and eval models. */
+const NOT_A_CHAT_MODEL = /embedding|aqa|imagen|veo|tts|audio|image|live|vision/i;
+
+/**
+ * Rank a model name: newest first, flash ahead of pro, stable ahead of preview.
+ *
+ * Flash wins because a shop reply is three sentences quoting a price — paying
+ * pro rates and pro latency for that is waste.
+ */
+function modelRank(name: string): number {
+  const version = name.match(/gemini-(\d+)(?:\.(\d+))?/);
+  const major = version ? Number(version[1]) : 0;
+  const minor = version ? Number(version[2] ?? 0) : 0;
+
+  let score = major * 1000 + minor * 10;
+  if (/flash/i.test(name)) score += 5;
+  if (/preview|exp|latest/i.test(name)) score -= 500;
+  return score;
+}
+
+/**
+ * Ask Google which models this key can actually use.
+ *
+ * Runs only after every configured name has failed, so it costs nothing on the
+ * normal path. A hardcoded list is a time bomb: it works until a retirement,
+ * then fails every request forever with no way for the app to recover itself.
+ * This turns that outage into one slow reply.
+ *
+ * The listing is a hint, not proof. Google lists models that still 404 on a
+ * real call — `gemini-2.5-flash` was advertised here as supporting
+ * generateContent while answering "no longer available to new users" — so a
+ * name from this list is tried, never trusted.
+ */
+async function discoverModels(apiKey: string): Promise<string[]> {
+  if (discoveryCache && Date.now() - discoveryCache.at < MODEL_CACHE_MS) {
+    return discoveryCache.models;
+  }
+
+  try {
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
+      headers: { "x-goog-api-key": apiKey },
+    });
+    if (!res.ok) return [];
+
+    const body = (await res.json().catch(() => ({}))) as {
+      models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+    };
+
+    const models = (body.models ?? [])
+      .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+      .map((m) => (m.name ?? "").replace(/^models\//, ""))
+      .filter((name) => name.startsWith("gemini-") && !NOT_A_CHAT_MODEL.test(name))
+      .sort((a, b) => modelRank(b) - modelRank(a));
+
+    // Only cache a useful answer. Caching an empty list would disable the
+    // safety net for ten minutes over one bad response — exactly when it is
+    // most needed.
+    if (models.length > 0) discoveryCache = { at: Date.now(), models };
+    return models;
+  } catch {
+    // Discovery is a safety net, never a new way to fail.
+    return [];
+  }
+}
 
 export interface MessageHistory {
   sender: "customer" | "bot" | "agent";
@@ -106,6 +185,16 @@ interface GeminiPart {
   text?: string;
   functionCall?: { name?: string; args?: Record<string, unknown> };
   functionResponse?: { name: string; response: Record<string, unknown> };
+}
+
+/** The shape of a generateContent response, success or failure. */
+interface GeminiResponse {
+  candidates?: Array<{
+    content?: { parts?: GeminiPart[] };
+    finishReason?: string;
+  }>;
+  promptFeedback?: { blockReason?: string };
+  error?: { message?: string; status?: string };
 }
 
 interface GeminiContent {
@@ -463,9 +552,8 @@ async function callGemini(
   contents: GeminiContent[],
   useTools: boolean
 ): Promise<GeminiPart[]> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
+  const send = (withThinking: boolean) =>
+    fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -479,25 +567,35 @@ async function callGemini(
         generationConfig: {
           temperature: 0.6,
           maxOutputTokens: MAX_OUTPUT_TOKENS,
-          // 2.5 models think before answering, and thinking is billed against
-          // the same output budget as the reply. Left on, the model can spend
-          // the whole budget reasoning and return a 200 with no parts at all —
-          // which reads exactly like "the model had nothing to say". A shop
-          // assistant quoting its own catalog does not need a scratchpad.
-          ...(supportsThinking(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+          // Thinking is billed against the same output budget as the reply.
+          // Left on, a model can spend the whole budget reasoning and return a
+          // 200 with no parts — which reads exactly like "nothing to say". A
+          // shop assistant quoting its own catalog does not need a scratchpad.
+          ...(withThinking ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
         },
       }),
-    }
-  );
+    });
 
-  const data = (await res.json().catch(() => ({}))) as {
-    candidates?: Array<{
-      content?: { parts?: GeminiPart[] };
-      finishReason?: string;
-    }>;
-    promptFeedback?: { blockReason?: string };
-    error?: { message?: string; status?: string };
-  };
+  const parse = async (response: Response) =>
+    (await response.json().catch(() => ({}))) as GeminiResponse;
+
+  const wantedThinking = supportsThinking(model);
+  let res = await send(wantedThinking);
+  let data = await parse(res);
+
+  // Which models accept thinkingConfig changes with every Google release, and
+  // a stale whitelist is precisely what left this app 404ing on three retired
+  // model names. So when Google objects to that specific field, drop it and
+  // ask once more instead of failing the customer over a tuning parameter.
+  if (
+    !res.ok &&
+    res.status === 400 &&
+    wantedThinking &&
+    /thinking/i.test(data.error?.message ?? "")
+  ) {
+    res = await send(false);
+    data = await parse(res);
+  }
 
   // Throw rather than return null. A silent null is indistinguishable from
   // "the model had nothing to say", so every failure used to land the customer
@@ -638,7 +736,12 @@ export async function generateCustomerReply(
       systemPrompt = "You are a helpful customer service assistant for an online shop.";
     }
 
-    for (const model of GEMINI_MODELS) {
+    const tried = new Set<string>();
+
+    const tryModel = async (model: string): Promise<CustomerReply | null> => {
+      if (tried.has(model)) return null;
+      tried.add(model);
+
       // Fresh contents per model: a half-finished tool exchange from a model
       // that died mid-loop would confuse the next one.
       const contents: GeminiContent[] = [
@@ -665,7 +768,27 @@ export async function generateCustomerReply(
       } catch (error) {
         console.warn(`Gemini ${model} failed, trying the next model:`, error);
         reasons.push(`${model}: ${error instanceof Error ? error.message : "failed"}`);
+        return null;
       }
+    };
+
+    for (const model of GEMINI_MODELS) {
+      const reply = await tryModel(model);
+      if (reply) return reply;
+    }
+
+    // Every configured name failed. The most likely reason by far is that they
+    // were retired, so ask Google what this key can actually use rather than
+    // answering from the catalog until someone notices and edits the code.
+    const discovered = (await discoverModels(apiKey)).filter((m) => !tried.has(m));
+
+    for (const model of discovered.slice(0, MAX_DISCOVERED_MODELS)) {
+      const reply = await tryModel(model);
+      if (reply) return reply;
+    }
+
+    if (discovered.length === 0) {
+      reasons.push("Google offered no other usable model for this key.");
     }
   }
 

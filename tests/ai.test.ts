@@ -2,6 +2,9 @@ import { test, describe, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.GEMINI_API_KEY ??= "test-key";
+// Pin a 2.5 model ahead of the default so the thinkingConfig path is covered:
+// the code offers that field to 2.5 only, and deliberately guesses no wider.
+process.env.GEMINI_MODEL ??= "gemini-2.5-flash";
 
 const realFetch = globalThis.fetch;
 
@@ -220,13 +223,17 @@ describe("generation config", () => {
   test("turns thinking off for 2.5 models and leaves it off the wire for older ones", async () => {
     const seen: Array<{ model: string; body: Record<string, any> }> = [];
 
-    globalThis.fetch = (async (url: unknown, init: { body: string }) => {
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
       const href = String(url);
-      if (href.includes("generativelanguage")) {
+      if (href.includes(":generateContent")) {
         const model = href.split("/models/")[1].split(":")[0];
-        seen.push({ model, body: JSON.parse(init.body) });
+        seen.push({ model, body: JSON.parse(init!.body!) });
         // Fail every model so the loop walks the whole list.
         return { ok: false, status: 500, json: async () => ({}) };
+      }
+      if (href.includes("generativelanguage")) {
+        // The model listing, consulted once every configured name has failed.
+        return { ok: true, status: 200, json: async () => ({ models: [] }) };
       }
       return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
     }) as unknown as typeof fetch;
@@ -279,5 +286,119 @@ describe("read-only mode", () => {
     );
 
     assert.notEqual(outcome.error, "This is a configuration test, so no order was placed.");
+  });
+});
+
+describe("surviving a model retirement", () => {
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test("falls back to a model Google lists when every configured name is retired", async () => {
+    const attempted: string[] = [];
+
+    globalThis.fetch = (async (url: unknown) => {
+      const href = String(url);
+
+      if (href.includes(":generateContent")) {
+        const model = href.split("/models/")[1].split(":")[0];
+        attempted.push(model);
+
+        // The exact failure that took this app down: the shipped names are
+        // retired, and only a model discovered at runtime still answers.
+        if (model === "gemini-9.9-flash") {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              candidates: [{ content: { parts: [{ text: "We sell mugs." }] } }],
+            }),
+          };
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({
+            error: { message: `${model} is no longer available to new users.` },
+          }),
+        };
+      }
+
+      if (href.includes("generativelanguage")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: [
+              { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
+              { name: "models/gemini-9.9-flash", supportedGenerationMethods: ["generateContent"] },
+              { name: "models/gemini-4.0-pro", supportedGenerationMethods: ["generateContent"] },
+            ],
+          }),
+        };
+      }
+
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+    }) as unknown as typeof fetch;
+
+    const { generateCustomerReply, GEMINI_MODELS } = await import("@/lib/ai/gemini");
+    const reply = await generateCustomerReply("biz-1", "what do you sell?", [], {
+      allowTools: false,
+    });
+
+    // A retirement should cost one slow reply, not an outage.
+    assert.equal(reply.source, "gemini");
+    assert.equal(reply.model, "gemini-9.9-flash");
+
+    for (const configured of GEMINI_MODELS) {
+      assert.ok(attempted.includes(configured), `${configured} must be tried first`);
+    }
+    // Newest flash beats an older pro, and an embedding model is never a
+    // candidate for answering a customer.
+    assert.ok(!attempted.includes("text-embedding-004"));
+    assert.ok(
+      attempted.indexOf("gemini-9.9-flash") < (attempted.indexOf("gemini-4.0-pro") + 1 || Infinity)
+    );
+  });
+
+  test("retries without thinkingConfig when a model rejects it", async () => {
+    const bodies: Array<Record<string, any>> = [];
+
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      const href = String(url);
+      if (href.includes(":generateContent")) {
+        const body = JSON.parse(init!.body!);
+        bodies.push(body);
+
+        if (body.generationConfig?.thinkingConfig) {
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({
+              error: { message: "thinkingConfig is not supported for this model" },
+            }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ candidates: [{ content: { parts: [{ text: "Hello." }] } }] }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+    }) as unknown as typeof fetch;
+
+    const { generateCustomerReply } = await import("@/lib/ai/gemini");
+    const reply = await generateCustomerReply("biz-1", "hi", [], { allowTools: false });
+
+    // Losing a customer's answer over a tuning parameter would be absurd.
+    assert.equal(reply.source, "gemini");
+    assert.ok(bodies.length >= 2, "must have retried");
+    assert.ok(bodies[0].generationConfig.thinkingConfig, "the first try carries the field");
+    assert.equal(
+      bodies[1].generationConfig.thinkingConfig,
+      undefined,
+      "the retry must drop the field Google objected to"
+    );
   });
 });

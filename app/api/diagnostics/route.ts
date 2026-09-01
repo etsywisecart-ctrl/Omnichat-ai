@@ -142,10 +142,15 @@ export async function GET(request: NextRequest) {
 
       // ---- Do the models we actually call exist on this key? ----
       //
-      // "50 models available" says nothing about whether gemini-2.5-flash is
-      // one of them. A retired or misspelled model name 404s on every single
-      // request while the key above tests perfectly, so this is the one check
-      // that catches the most confusing failure this app has.
+      // "50 models available" says nothing about whether the model this app
+      // calls is one of them. A retired name 404s on every request while the
+      // key above tests perfectly — the most confusing failure this app has.
+      //
+      // Being listed here is necessary but NOT sufficient: Google advertised
+      // gemini-2.5-flash in this very listing, declaring generateContent
+      // support, while answering real calls with "no longer available to new
+      // users". So this check can only rule a model *out*. Only the live test
+      // rules one in, which is why the wording below refuses to claim more.
       if (res.ok) {
         const available = new Set(
           (body.models ?? [])
@@ -184,8 +189,8 @@ export async function GET(request: NextRequest) {
           ok: usable.length > 0,
           detail: problems.length
             ? `Configured: ${GEMINI_MODELS.join(", ")} — ${problems.join("; ")}.` +
-              (usable.length ? ` Still usable: ${usable.join(", ")}.` : "")
-            : `All ${GEMINI_MODELS.length} configured model(s) exist and can generate: ${GEMINI_MODELS.join(", ")}.`,
+              (usable.length ? ` Google still lists: ${usable.join(", ")}.` : "")
+            : `Google lists all ${GEMINI_MODELS.length} configured model(s): ${GEMINI_MODELS.join(", ")}. Being listed is not the same as answering — “Test the AI for real” is the proof.`,
           fix:
             usable.length === 0
               ? "Every model name this app calls was rejected by your key. Set GEMINI_MODEL in Vercel to one Google lists for you, then REDEPLOY."
