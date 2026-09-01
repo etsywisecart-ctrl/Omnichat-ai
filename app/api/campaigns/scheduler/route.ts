@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/server";
+import { deliverCampaign } from "@/lib/campaigns/deliver";
 
 /**
  * POST /api/campaigns/scheduler
@@ -14,9 +15,14 @@ import { supabaseAdmin } from "@/lib/supabase/server";
  *   the request rather than running unprotected
  * - Only opted-in contacts become recipients
  *
- * NOTE: this queues recipient rows. Channel delivery is not wired up yet, so
- * campaigns stay 'scheduled' — they are never reported as sent until a real
- * send happens.
+ * Recipients are written down first and sent second, on purpose: a broadcast
+ * cannot be recalled, so who will receive it is decided and recorded before
+ * anything is transmitted. A campaign is only marked 'sent' once messages have
+ * actually left, and 'failed' if every one of them failed.
+ *
+ * Large campaigns are delivered across several runs — a serverless function is
+ * killed at its timeout without warning — so call this again while `remaining`
+ * is above zero.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -58,7 +64,10 @@ export async function POST(request: NextRequest) {
     }
 
     let totalQueued = 0;
+    let totalSent = 0;
     let totalFailed = 0;
+    let totalSkipped = 0;
+    let totalRemaining = 0;
 
     for (const campaign of campaigns) {
       try {
@@ -97,29 +106,32 @@ export async function POST(request: NextRequest) {
         }));
 
         if (recipients.length > 0) {
+          // A previous run may have timed out partway through, leaving rows
+          // behind. ignoreDuplicates keeps those at whatever status they
+          // reached — re-inserting would reset a delivered message to pending
+          // and send it a second time.
           const { error: recipientsError } = await supabaseAdmin
             .from("campaign_recipients")
-            .insert(recipients);
+            .upsert(recipients, {
+              onConflict: "campaign_id,customer_identifier",
+              ignoreDuplicates: true,
+            });
 
           if (recipientsError) throw recipientsError;
         }
 
-        // Recipients are queued as 'pending'. Delivery through the channel
-        // APIs is not wired up yet, so the campaign stays 'scheduled' rather
-        // than reporting a broadcast that never left the building. The status
-        // moves to 'sent' only when a delivery worker marks the recipients
-        // sent.
-        const { error: updateError } = await supabaseAdmin
-          .from("campaigns")
-          .update({ updated_at: now.toISOString() })
-          .eq("id", campaign.id);
-
-        if (updateError) throw updateError;
-
         totalQueued += recipients.length;
 
+        // ---- Send ----
+        const delivery = await deliverCampaign(campaign.id);
+        totalSent += delivery.sent;
+        totalFailed += delivery.failed;
+        totalSkipped += delivery.skipped;
+        totalRemaining += delivery.remaining;
+
         console.log(
-          `Campaign ${campaign.id}: queued ${recipients.length} recipient(s); awaiting a delivery worker.`
+          `Campaign ${campaign.id}: queued ${recipients.length}, sent ${delivery.sent}, ` +
+            `failed ${delivery.failed}, skipped ${delivery.skipped}, ${delivery.remaining} left.`
         );
       } catch (campaignError) {
         console.error(`Error processing campaign ${campaign.id}:`, campaignError);
@@ -139,8 +151,14 @@ export async function POST(request: NextRequest) {
         message: "Campaigns processed",
         processed: campaigns.length,
         totalQueued,
+        totalSent,
         totalFailed,
-        note: "Recipients are queued as pending. Channel delivery is not implemented yet.",
+        totalSkipped,
+        remaining: totalRemaining,
+        note:
+          totalRemaining > 0
+            ? `${totalRemaining} message(s) still queued — call this again to send the next batch.`
+            : "Nothing left queued.",
       },
       { status: 200 }
     );

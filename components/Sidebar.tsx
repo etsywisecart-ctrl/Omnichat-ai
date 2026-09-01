@@ -85,6 +85,11 @@ export default function Sidebar() {
         <span>Try your agent</span>
       </a>
 
+      <a className="navi" href="/widget">
+        <OutlineIcon d="M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-4 4v-4H5a2 2 0 0 1-2-2z" />
+        <span>Website chat</span>
+      </a>
+
       <button className="navi" onClick={toggleTheme}>
         <OutlineIcon d={dark ? THEME_ICON.dark : THEME_ICON.light} />
         <span>{dark ? "Light mode" : "Dark mode"}</span>
