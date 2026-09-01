@@ -89,6 +89,13 @@ export interface ReplyOptions {
   customerName?: string;
   /** Set false to answer without offering to place orders. */
   allowTools?: boolean;
+  /**
+   * Refuse any tool that writes. The tools are still declared, so the request
+   * sent to Gemini is byte-for-byte the production one — which is the point:
+   * a malformed tool declaration 400s every real reply, and a check that
+   * quietly dropped the tools would report that setup as healthy.
+   */
+  readOnly?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +355,13 @@ export async function processToolCall(
     }
 
     if (toolName === "create_order") {
+      if (options.readOnly) {
+        return {
+          success: false,
+          error: "This is a configuration test, so no order was placed. Tell the customer what you would have ordered instead.",
+        };
+      }
+
       const items = Array.isArray(params.items)
         ? (params.items as Array<{ product_id: string; quantity: number }>)
         : [];

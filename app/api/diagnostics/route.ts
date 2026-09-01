@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveBusiness, UNAUTHORIZED } from "@/lib/supabase/auth";
 import { supabaseAdmin, serviceRoleKeyProblem } from "@/lib/supabase/server";
-import { GEMINI_MODELS } from "@/lib/ai/gemini";
+import { GEMINI_MODELS, generateCustomerReply } from "@/lib/ai/gemini";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,7 +19,15 @@ export const dynamic = "force-dynamic";
  * Requires a signed-in agent: it reveals which services are configured, which
  * is not something to hand to anonymous callers. Values are never returned —
  * only a masked shape, so a typo is visible without exposing the secret.
+ *
+ * `?live=1` adds a real round-trip to Gemini. It costs a model call, so it is
+ * opt-in — but it is the only check that answers the question that matters:
+ * not "is the key valid" but "does asking this app a question produce an
+ * answer". Everything else can be green while that one fails.
  */
+
+/** The question the live test asks. Harmless, and shaped like a real one. */
+const LIVE_PROBE = "Hi, what products do you sell?";
 
 /** `sb_secret_abc…xyz` — enough to spot a wrong key, useless to steal. */
 function shape(value: string | undefined): string {
@@ -186,6 +194,43 @@ export async function GET(request: NextRequest) {
       : `${productCount ?? 0} active product(s) the AI can quote.`,
     fix: (productCount ?? 0) === 0 ? "Upload a CSV on the Catalog page." : undefined,
   });
+
+  // ---- The live round-trip, when asked for ----
+  if (request.nextUrl.searchParams.get("live") === "1") {
+    try {
+      const started = Date.now();
+      // readOnly, so a model that decides to place an order during a
+      // configuration test cannot actually place one.
+      const reply = await generateCustomerReply(ctx.businessId, LIVE_PROBE, [], {
+        channelType: "web",
+        readOnly: true,
+      });
+      const ms = Date.now() - started;
+
+      const answered = reply.source === "gemini";
+      checks.push({
+        name: "AI reply (live test)",
+        ok: answered,
+        detail: answered
+          ? `${reply.model} answered in ${(ms / 1000).toFixed(1)}s: “${reply.text.slice(0, 120)}${reply.text.length > 120 ? "…" : ""}”`
+          : reply.reason
+            ? `No model answered — ${reply.reason}`
+            : `No model answered, and none said why (fell back to: ${reply.source}).`,
+        fix: answered
+          ? undefined
+          : "The text above is Google's own words, per model. A 404 means that model name doesn't exist on your key — set GEMINI_MODEL in Vercel and REDEPLOY.",
+      });
+    } catch (error) {
+      // generateCustomerReply is built never to throw, so this is a bug
+      // rather than a configuration problem. Say which.
+      checks.push({
+        name: "AI reply (live test)",
+        ok: false,
+        detail: `The AI crashed instead of falling back: ${error instanceof Error ? error.message : "unknown"}`,
+        fix: "This is a bug in the app, not a setting. Report it with this message.",
+      });
+    }
+  }
 
   const failing = checks.filter((c) => !c.ok);
 

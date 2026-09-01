@@ -250,3 +250,34 @@ describe("generation config", () => {
     }
   });
 });
+
+describe("read-only mode", () => {
+  test("refuses to place an order, and says so in words the model can relay", async () => {
+    const { processToolCall } = await import("@/lib/ai/gemini");
+
+    const outcome = await processToolCall(
+      "biz-1",
+      "create_order",
+      { customer_name: "Test", items: [{ product_id: "p1", quantity: 1 }] },
+      { readOnly: true }
+    );
+
+    // The live diagnostic runs the real tool declarations against a real
+    // catalog. Without this guard, clicking "test the AI" could bill someone.
+    assert.equal(outcome.success, false);
+    assert.match(outcome.error ?? "", /no order was placed/i);
+  });
+
+  test("still allows the read-only tools through", async () => {
+    const { processToolCall } = await import("@/lib/ai/gemini");
+
+    const outcome = await processToolCall(
+      "biz-1",
+      "search_products",
+      { query: "mug" },
+      { readOnly: true }
+    );
+
+    assert.notEqual(outcome.error, "This is a configuration test, so no order was placed.");
+  });
+});

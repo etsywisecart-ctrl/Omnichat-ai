@@ -51,21 +51,25 @@ export default function Playground() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [diag, setDiag] = useState<Diagnostics | null>(null);
-  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagBusy, setDiagBusy] = useState<false | "setup" | "live">(false);
   const [diagError, setDiagError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   // The diagnostics endpoint needs the caller's token, so it can't just be
   // opened in the address bar. Running it from here keeps it one click away.
-  const runDiagnostics = async () => {
-    setDiagBusy(true);
+  //
+  // `live` adds a real Gemini round-trip: slower and one model call, but it
+  // reports the actual error text per model instead of leaving you to infer a
+  // cause from a reply that silently fell back.
+  const runDiagnostics = async (live = false) => {
+    setDiagBusy(live ? "live" : "setup");
     setDiagError(null);
     try {
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
       if (!token) throw new Error("Sign in first");
 
-      const res = await fetch("/api/diagnostics", {
+      const res = await fetch(live ? "/api/diagnostics?live=1" : "/api/diagnostics", {
         headers: { Authorization: `Bearer ${token}` },
       });
       const payload = await res.json().catch(() => null);
@@ -161,11 +165,24 @@ export default function Playground() {
 
         <div className="card" style={{ marginTop: 12, padding: 14 }}>
           <div className="fx ac gap8 wrap">
-            <button className="btn" onClick={runDiagnostics} disabled={diagBusy || !session}>
-              {diagBusy ? "Checking…" : "Check setup"}
+            <button
+              className="btn"
+              onClick={() => runDiagnostics(false)}
+              disabled={Boolean(diagBusy) || !session}
+            >
+              {diagBusy === "setup" ? "Checking…" : "Check setup"}
+            </button>
+            <button
+              className="btn"
+              onClick={() => runDiagnostics(true)}
+              disabled={Boolean(diagBusy) || !session}
+            >
+              {diagBusy === "live" ? "Asking Gemini…" : "Test the AI for real"}
             </button>
             <span className="mut fs12">
               Reports which keys are actually working, so a silent AI resolves to one named setting.
+              The second button asks Gemini a real question and prints Google&rsquo;s own error if it
+              refuses.
             </span>
           </div>
 
