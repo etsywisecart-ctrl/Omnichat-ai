@@ -31,9 +31,19 @@ export default function LoginPage() {
         if (error) throw error;
         router.replace("/");
       } else {
-        const { error } = await supabase.auth.signUp({ email, password });
+        // Without emailRedirectTo the confirmation link goes to whatever Site
+        // URL Supabase has configured — by default http://localhost:3000, which
+        // is a dead link for everyone who is not the developer. Sending people
+        // back to the origin they actually signed up on is always right.
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
+        });
         if (error) throw error;
-        setNotice("Account created. If email confirmation is on, check your inbox — otherwise you're signed in now.");
+        setNotice(
+          "Account created. If email confirmation is on, open the link in your inbox — it will bring you back here signed in. Otherwise you're signed in already."
+        );
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
