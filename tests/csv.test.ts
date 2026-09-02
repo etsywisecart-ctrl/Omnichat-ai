@@ -164,3 +164,49 @@ describe("real store exports", () => {
     assert.equal(result.products[0].is_active, true);
   });
 });
+
+describe("records that span several lines", () => {
+  test("a quoted description containing line breaks does not end the record", async () => {
+    const { parseCSV } = await import("@/lib/products/csv");
+
+    // Exactly the shape of a real Shopify export: the description holds
+    // newlines, so the record covers four physical lines. Splitting the file
+    // on "\n" first cut it into fragments with no title, which were then
+    // discarded as blank — a 24-product export imported as 3.
+    const csv =
+      "Handle,Title,Body (HTML),Variant SKU,Variant Price,Status\n" +
+      'watch-1,Skeleton Automatic Watch,"<p>Elevate your style.\n' +
+      "\n" +
+      'Precision and elegance in one timepiece.</p>",SKEL-1,4099.00,active\n' +
+      "watch-2,Two-Tone Quartz Watch,<p>Plain</p>,TWO-1,3000.00,active";
+
+    const result = parseCSV(csv);
+
+    assert.equal(result.products.length, 2, "both products must survive");
+    assert.equal(result.products[0].name, "Skeleton Automatic Watch");
+    assert.equal(result.products[0].price_cents, 409900);
+    assert.equal(result.products[1].name, "Two-Tone Quartz Watch");
+    // The line breaks inside the description collapse to single spaces.
+    assert.match(result.products[0].description!, /Elevate your style\. Precision/);
+    // No fragment was mistaken for a product row.
+    assert.equal(result.skippedNoName, 0);
+  });
+
+  test("parseRows keeps escaped quotes and separates records", async () => {
+    const { parseRows } = await import("@/lib/products/csv");
+
+    const rows = parseRows('a,b\n"say ""hi""","line1\nline2"\n');
+
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows[0], ["a", "b"]);
+    assert.equal(rows[1][0], 'say "hi"');
+    assert.equal(rows[1][1], "line1\nline2");
+  });
+
+  test("a trailing newline does not invent an empty product", async () => {
+    const { parseRows } = await import("@/lib/products/csv");
+
+    assert.equal(parseRows("name,price\nMug,18.00\n").length, 2);
+    assert.equal(parseRows("name,price\nMug,18.00\n\n\n").length, 2);
+  });
+});

@@ -41,7 +41,10 @@ export default function Catalog() {
 
           say(
             `Imported ${r.imported} product${r.imported === 1 ? "" : "s"}` +
-              (reasons.length ? ` · skipped ${reasons.join(", ")}` : "")
+              (reasons.length ? ` · skipped ${reasons.join(", ")}` : "") +
+              (r.renamed
+                ? ` · ${r.renamed} shared a product code and were given their own`
+                : "")
           );
         },
         onError: (err) => say(err instanceof Error ? err.message : "Upload failed"),

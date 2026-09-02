@@ -134,6 +134,64 @@ export function plainText(raw: string): string {
 }
 
 /**
+ * Split a whole CSV into rows of fields in one pass.
+ *
+ * A record does NOT end at every newline. A quoted field may contain line
+ * breaks, and store descriptions routinely do — a Shopify export of 24
+ * products arrived as 310 lines but only 100 records. Splitting on "\n" first
+ * cut those records in half mid-description, so the fragments carried no title
+ * and were discarded as empty rows: 24 products imported as 3.
+ *
+ * So quoting has to be tracked across the entire file, not within a line.
+ */
+export function parseRows(csv: string): string[][] {
+  const text = csv.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        // "" is an escaped quote, a lone " ends the field.
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(field.trim());
+      field = "";
+    } else if (ch === "\n") {
+      row.push(field.trim());
+      field = "";
+      rows.push(row);
+      row = [];
+    } else {
+      field += ch;
+    }
+  }
+
+  row.push(field.trim());
+  rows.push(row);
+
+  // A trailing newline leaves one empty row behind; so does a blank line.
+  return rows.filter((r) => r.some((value) => value !== ""));
+}
+
+/**
  * Split one CSV line, honouring quoted fields and "" escapes, so a comma
  * inside a description doesn't shift every remaining column.
  */
@@ -202,7 +260,7 @@ export function skuFromName(name: string): string {
 }
 
 export function parseCSV(csv: string): ParseResult {
-  const lines = csv.replace(/\r\n?/g, "\n").trim().split("\n");
+  const rows = parseRows(csv);
   const empty: ParseResult = {
     products: [],
     skipped: 0,
@@ -211,9 +269,9 @@ export function parseCSV(csv: string): ParseResult {
     headers: [],
     missing: ["name", "price"],
   };
-  if (lines.length < 2) return empty;
+  if (rows.length < 2) return empty;
 
-  const headers = splitCSVLine(lines[0]).map((h) => h.replace(/^\uFEFF/, "").trim());
+  const headers = rows[0].map((h) => h.replace(/^\uFEFF/, "").trim());
   const columns = resolveColumns(headers);
 
   const missing: string[] = [];
@@ -224,10 +282,8 @@ export function parseCSV(csv: string): ParseResult {
   let skippedNoName = 0;
   let skippedNoPrice = 0;
 
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-
-    const values = splitCSVLine(lines[i]);
+  for (let i = 1; i < rows.length; i++) {
+    const values = rows[i];
     const at = (key: string): string =>
       columns[key] === undefined ? "" : (values[columns[key]] ?? "").trim();
 

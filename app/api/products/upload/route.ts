@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveBusiness, UNAUTHORIZED } from "@/lib/supabase/auth";
-import { parseCSV } from "@/lib/products/csv";
+import { parseCSV, skuFromName } from "@/lib/products/csv";
 
 export const runtime = "nodejs";
 
@@ -45,10 +45,33 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "no_valid_rows", message }, { status: 400 });
     }
 
-    // Last row wins on a repeated SKU. Without this, Postgres rejects the whole
-    // batch with "ON CONFLICT DO UPDATE command cannot affect row a second time".
+    // A repeated SKU has to be resolved before the upsert, or Postgres rejects
+    // the whole batch with "ON CONFLICT DO UPDATE command cannot affect row a
+    // second time".
+    //
+    // But two *different* products can share a code in a real export — one
+    // Shopify file had two watches both listed as "'10". Letting the last row
+    // win would drop a product with no mention of it, so a colliding row keeps
+    // its own code plus a suffix from its name: unique, and derived only from
+    // the product itself, so every later upload produces the same code and
+    // updates that row instead of adding another.
     const bySku = new Map<string, (typeof products)[number]>();
-    for (const p of products) bySku.set(p.sku, p);
+    let renamed = 0;
+
+    for (const product of products) {
+      const held = bySku.get(product.sku);
+
+      // Genuinely the same product listed twice: last row wins, as before.
+      if (!held || held.name === product.name) {
+        bySku.set(product.sku, product);
+        continue;
+      }
+
+      const distinct = `${product.sku}-${skuFromName(product.name)}`.slice(0, 120);
+      bySku.set(distinct, { ...product, sku: distinct });
+      renamed++;
+    }
+
     const unique = [...bySku.values()];
 
     const { data: inserted, error } = await ctx.supabase
@@ -89,6 +112,7 @@ export async function POST(request: NextRequest) {
       skipped: skipped + (products.length - unique.length),
       skippedNoName,
       skippedNoPrice,
+      renamed,
       products: inserted,
     });
   } catch (error) {

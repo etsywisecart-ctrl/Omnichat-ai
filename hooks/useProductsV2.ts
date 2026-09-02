@@ -139,6 +139,7 @@ export function useUploadProducts() {
         skipped: number;
         skippedNoName: number;
         skippedNoPrice: number;
+        renamed: number;
       };
     },
     onSuccess: () => {
