@@ -9,8 +9,10 @@ export const runtime = "nodejs";
  * Import a product CSV into the signed-in user's catalog.
  *
  * Columns: name (required), price or price_cents (required), sku, currency,
- * description. The business is taken from the caller's session — never from
- * the request body — so one tenant can't write into another's catalog.
+ * description — matched against the titles real stores export, so a Shopify or
+ * WooCommerce file imports as downloaded. The business is taken from the
+ * caller's session — never from the request body — so one tenant can't write
+ * into another's catalog.
  */
 export async function POST(request: NextRequest) {
   const ctx = await resolveBusiness(request);
@@ -28,17 +30,19 @@ export async function POST(request: NextRequest) {
     }
 
     const csv = await file.text();
-    const { products, skipped } = parseCSV(csv);
+    const { products, skipped, skippedNoName, skippedNoPrice, headers, missing } = parseCSV(csv);
 
     if (products.length === 0) {
-      return NextResponse.json(
-        {
-          error: "no_valid_rows",
-          message:
-            "No usable rows found. Each row needs a name and a price (or price_cents).",
-        },
-        { status: 400 }
-      );
+      // Name the columns the file actually has. "No usable rows" alone sends
+      // someone hunting through a spreadsheet for a fault we can already see.
+      const seen = headers.length ? headers.slice(0, 12).join(", ") : "(none)";
+      const message = missing.length
+        ? `Couldn't find a ${missing.join(" or ")} column. The file's columns are: ${seen}. ` +
+          `Rename the one holding the ${missing[0]} to "${missing[0]}" and upload again.`
+        : `Found the right columns, but no row had both a name and a price. ` +
+          `${skippedNoName} row(s) had no name and ${skippedNoPrice} had no price.`;
+
+      return NextResponse.json({ error: "no_valid_rows", message }, { status: 400 });
     }
 
     // Last row wins on a repeated SKU. Without this, Postgres rejects the whole
@@ -58,7 +62,8 @@ export async function POST(request: NextRequest) {
           price_cents: p.price_cents,
           currency: p.currency,
           source: "csv",
-          is_active: true,
+          // A draft or unpublished product must not be quoted to a customer.
+          is_active: p.is_active,
           updated_at: new Date().toISOString(),
         })),
         { onConflict: "business_id,sku", ignoreDuplicates: false }
@@ -73,10 +78,17 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const imported = inserted?.length ?? 0;
+
     return NextResponse.json({
       success: true,
-      inserted: inserted?.length ?? 0,
+      // Both spellings: the dashboard reads `imported`, and returning only
+      // `inserted` is why the success toast said "Imported undefined products".
+      imported,
+      inserted: imported,
       skipped: skipped + (products.length - unique.length),
+      skippedNoName,
+      skippedNoPrice,
       products: inserted,
     });
   } catch (error) {

@@ -83,3 +83,84 @@ describe("end-to-end parse", () => {
     assert.equal(products[0].price_cents, 1250);
   });
 });
+
+describe("real store exports", () => {
+  test("imports a Shopify export as downloaded", async () => {
+    const { parseCSV } = await import("@/lib/products/csv");
+
+    // Shopify's real header row and its variant/image continuation rows,
+    // which repeat a product with the Title left blank.
+    const csv = [
+      "Handle,Title,Body (HTML),Vendor,Variant SKU,Variant Price,Status",
+      'espresso-set,Espresso Cup Set,"<p>Four porcelain cups, <b>80ml</b> each</p>",Acme,ESP-4,32.00,active',
+      "espresso-set,,,,ESP-6,44.00,active",
+      "blue-mug,Blue Ceramic Mug,<p>Hand glazed</p>,Acme,MUG-B,18.00,active",
+      "secret,Unreleased Teapot,<p>Coming soon</p>,Acme,TEA-1,55.00,draft",
+    ].join("\n");
+
+    const result = parseCSV(csv);
+
+    // "Title" and "Variant Price" — the reason a genuine export used to fail
+    // with "no usable rows" before any of this was matched.
+    assert.equal(result.missing.length, 0);
+    assert.equal(result.products.length, 3);
+
+    const cups = result.products[0];
+    assert.equal(cups.name, "Espresso Cup Set");
+    assert.equal(cups.sku, "ESP-4");
+    assert.equal(cups.price_cents, 3200);
+    // Body (HTML) is literal markup; the model must not read tags aloud.
+    assert.equal(cups.description, "Four porcelain cups, 80ml each");
+
+    // A draft product must never be quoted to a customer.
+    const teapot = result.products.find((p) => p.name === "Unreleased Teapot");
+    assert.equal(teapot?.is_active, false);
+    assert.equal(cups.is_active, true);
+
+    // The blank-title variant row is a continuation, not a product.
+    assert.equal(result.skippedNoName, 1);
+  });
+
+  test("imports a WooCommerce export as downloaded", async () => {
+    const { parseCSV } = await import("@/lib/products/csv");
+
+    const csv = [
+      "ID,Type,SKU,Name,Published,Short description,Regular price,Sale price",
+      "12,simple,BALM-W,Beeswax Wood Balm,1,Walnut scented,9.75,8.00",
+      "13,simple,MUG-B,Blue Ceramic Mug,-1,Hand glazed,18.00,",
+    ].join("\n");
+
+    const result = parseCSV(csv);
+
+    assert.equal(result.missing.length, 0);
+    assert.equal(result.products.length, 2);
+    assert.equal(result.products[0].name, "Beeswax Wood Balm");
+    // "Regular price" must win over "Sale price" — quoting a lapsed discount
+    // to every customer would be worse than quoting nothing.
+    assert.equal(result.products[0].price_cents, 975);
+    // Published = -1 is WooCommerce's draft.
+    assert.equal(result.products[1].is_active, false);
+  });
+
+  test("reports the columns it actually found when nothing matches", async () => {
+    const { parseCSV } = await import("@/lib/products/csv");
+
+    const result = parseCSV("Item,Cost\nMug,18.00");
+
+    assert.deepEqual(result.products, []);
+    assert.deepEqual(result.missing, ["name", "price"]);
+    // The upload error quotes these back, so a mismatch is shown rather than
+    // left for someone to hunt through a spreadsheet for.
+    assert.deepEqual(result.headers, ["Item", "Cost"]);
+  });
+
+  test("still accepts our own documented column names", async () => {
+    const { parseCSV } = await import("@/lib/products/csv");
+
+    const result = parseCSV("name,sku,price,currency,description\nMug,MUG-1,18.00,EUR,Blue");
+
+    assert.equal(result.products.length, 1);
+    assert.equal(result.products[0].currency, "EUR");
+    assert.equal(result.products[0].is_active, true);
+  });
+});

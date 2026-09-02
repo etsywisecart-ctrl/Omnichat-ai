@@ -1,9 +1,9 @@
 "use client";
 
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { useProducts, useToggleProduct } from "@/hooks/useProducts";
-import { useUploadProducts } from "@/hooks/useProductsV2";
+import { useUploadProducts, useCreateProduct } from "@/hooks/useProductsV2";
 import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
 import { EmptyState, LoadingState, NotConnectedNotice } from "@/components/State";
 
@@ -13,6 +13,9 @@ export default function Catalog() {
   const { data: prods, isLoading } = useProducts();
   const toggleProduct = useToggleProduct();
   const uploadProducts = useUploadProducts();
+  const createProduct = useCreateProduct();
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({ name: "", price: "", sku: "", description: "" });
   const q = useDashboardStore((s) => s.q);
   const setQuery = useDashboardStore((s) => s.setQuery);
   const say = useDashboardStore((s) => s.say);
@@ -28,11 +31,19 @@ export default function Catalog() {
     const file = e.target.files?.[0];
     if (file) {
       uploadProducts.mutate(file, {
-        onSuccess: (r) =>
+        onSuccess: (r) => {
+          // Name the two reasons separately: a Shopify export skips a row per
+          // variant and image, which is normal, while a missing price is not.
+          const reasons = [
+            r.skippedNoName ? `${r.skippedNoName} with no name` : "",
+            r.skippedNoPrice ? `${r.skippedNoPrice} with no price` : "",
+          ].filter(Boolean);
+
           say(
             `Imported ${r.imported} product${r.imported === 1 ? "" : "s"}` +
-              (r.skipped ? ` · skipped ${r.skipped} row(s) with no name` : "")
-          ),
+              (reasons.length ? ` · skipped ${reasons.join(", ")}` : "")
+          );
+        },
         onError: (err) => say(err instanceof Error ? err.message : "Upload failed"),
       });
       if (fileInputRef.current) {
@@ -75,13 +86,70 @@ export default function Catalog() {
             >
               {uploadProducts.isPending ? "Uploading…" : "Sync catalog"}
             </button>
-            <button className="btn-p" onClick={() => say("Wire this button to an insert into products")}>
-              Add product
+            <button className="btn-p" onClick={() => setAdding((open) => !open)}>
+              {adding ? "Cancel" : "Add product"}
             </button>
           </div>
         </div>
 
         {notConnected && <NotConnectedNotice />}
+
+        {adding && (
+          <form
+            className="card mt12"
+            style={{ padding: 16 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              createProduct.mutate(draft, {
+                onSuccess: () => {
+                  say(`Added ${draft.name}`);
+                  setDraft({ name: "", price: "", sku: "", description: "" });
+                  setAdding(false);
+                },
+                onError: (err) =>
+                  say(err instanceof Error ? err.message : "Couldn't add that product"),
+              });
+            }}
+          >
+            <div className="fx ac gap8 wrap" style={{ marginBottom: 10 }}>
+              <input
+                className="inp"
+                style={{ flex: "2 1 200px" }}
+                placeholder="Product name"
+                required
+                autoFocus
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              />
+              <input
+                className="inp"
+                style={{ flex: "1 1 110px" }}
+                placeholder="Price, e.g. 32.00"
+                required
+                inputMode="decimal"
+                value={draft.price}
+                onChange={(e) => setDraft({ ...draft, price: e.target.value })}
+              />
+              <input
+                className="inp"
+                style={{ flex: "1 1 130px" }}
+                placeholder="Product code (optional)"
+                value={draft.sku}
+                onChange={(e) => setDraft({ ...draft, sku: e.target.value })}
+              />
+            </div>
+            <input
+              className="inp w100"
+              style={{ marginBottom: 10 }}
+              placeholder="Description — the agent reads this out to customers"
+              value={draft.description}
+              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+            />
+            <button className="btn-p" type="submit" disabled={createProduct.isPending}>
+              {createProduct.isPending ? "Adding…" : "Add to catalog"}
+            </button>
+          </form>
+        )}
 
         {isLoading ? (
           <LoadingState rows={5} />

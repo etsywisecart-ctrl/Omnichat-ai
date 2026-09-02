@@ -48,6 +48,67 @@ export function useToggleProduct() {
   });
 }
 
+export interface NewProduct {
+  name: string;
+  price: string;
+  sku?: string;
+  description?: string;
+  currency?: string;
+}
+
+/**
+ * Add one product by hand.
+ *
+ * The price arrives as typed ("32", "32.50", "$32") and is converted here, so
+ * a shop owner never has to think in cents — the same rule the CSV importer
+ * uses, kept identical on purpose.
+ */
+export function useCreateProduct() {
+  const qc = useQueryClient();
+  const { data: businessId } = useCurrentBusinessId();
+
+  return useMutation({
+    mutationFn: async (input: NewProduct) => {
+      if (!businessId) throw new Error("No business is connected yet.");
+
+      const name = input.name.trim();
+      if (!name) throw new Error("Give the product a name.");
+
+      const amount = Number.parseFloat((input.price || "").replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(amount) || amount < 0) {
+        throw new Error("Enter a price, like 32.00");
+      }
+
+      // Matches the importer: a blank SKU becomes one derived from the name,
+      // so a hand-added product can still be updated by a later CSV upload.
+      const sku =
+        input.sku?.trim() ||
+        name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+
+      const { error } = await supabase.from("products").insert({
+        business_id: businessId,
+        name,
+        sku,
+        description: input.description?.trim() || null,
+        price_cents: Math.round(amount * 100),
+        currency: (input.currency || "USD").toUpperCase(),
+        source: "manual",
+        is_active: true,
+      } as never);
+
+      if (error) {
+        // The unique index on (business_id, sku) is the usual cause, and
+        // "duplicate key value violates..." helps nobody.
+        if (error.code === "23505") {
+          throw new Error(`A product with the code "${sku}" already exists.`);
+        }
+        throw error;
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["products"] }),
+  });
+}
+
 export function useUploadProducts() {
   const qc = useQueryClient();
 
@@ -73,7 +134,12 @@ export function useUploadProducts() {
         throw new Error(payload.message || payload.error || "Upload failed");
       }
 
-      return payload as { imported: number; skipped: number };
+      return payload as {
+        imported: number;
+        skipped: number;
+        skippedNoName: number;
+        skippedNoPrice: number;
+      };
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["products"] });

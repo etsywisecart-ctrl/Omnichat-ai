@@ -12,6 +12,125 @@ export interface CSVProduct {
   price_cents: number;
   currency: string;
   description?: string;
+  /** Draft and unpublished products must not be quoted to customers. */
+  is_active: boolean;
+}
+
+export interface ParseResult {
+  products: CSVProduct[];
+  skipped: number;
+  /** Split out because "no name" and "no price" need different fixes. */
+  skippedNoName: number;
+  skippedNoPrice: number;
+  /** The column titles actually found, so a mismatch can be shown, not guessed. */
+  headers: string[];
+  /** Which required columns could not be matched to anything. */
+  missing: string[];
+}
+
+/**
+ * Column titles real stores export, mapped to the ones we need.
+ *
+ * No shop exports a file with our column names. Shopify writes "Title" and
+ * "Variant Price"; WooCommerce writes "Name" and "Regular price". Requiring
+ * exactly `name` and `price` meant every genuine export failed with "no usable
+ * rows" and left the shop owner renaming headers in a spreadsheet before they
+ * could import their own catalog.
+ *
+ * Order matters: the first alias present in the file wins, so "Regular price"
+ * is preferred over "Sale price" when a WooCommerce export carries both.
+ */
+const COLUMN_ALIASES: Record<string, string[]> = {
+  name: ["name", "title", "product name", "product title", "item name", "product"],
+  price: [
+    "price",
+    "regular price",
+    "variant price",
+    "unit price",
+    "sale price",
+    "price (incl. tax)",
+  ],
+  price_cents: ["price_cents", "price cents"],
+  sku: ["sku", "variant sku", "product sku", "item sku"],
+  description: [
+    "description",
+    "body (html)",
+    "body_html",
+    "body html",
+    "short description",
+    "product description",
+    "body",
+  ],
+  currency: ["currency", "variant currency"],
+  status: ["status", "published", "is_active", "active", "visibility"],
+};
+
+/** Values that mean "do not offer this to customers". */
+const INACTIVE_VALUES = new Set([
+  "draft",
+  "archived",
+  "private",
+  "pending",
+  "hidden",
+  "false",
+  "no",
+  "0",
+  "-1",
+]);
+
+/** Long store descriptions are HTML and can run to pages; the AI needs a line. */
+const MAX_DESCRIPTION = 400;
+
+/** Strip a byte-order mark and normalise spacing so headers compare reliably. */
+function normaliseHeader(raw: string): string {
+  return raw.replace(/^\uFEFF/, "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Match each column we need to a column in the file.
+ *
+ * Returns indexes rather than a keyed row so a file with two columns of the
+ * same name cannot silently overwrite the one we picked.
+ */
+export function resolveColumns(headers: string[]): Record<string, number> {
+  const normalised = headers.map(normaliseHeader);
+  const found: Record<string, number> = {};
+
+  for (const [canonical, aliases] of Object.entries(COLUMN_ALIASES)) {
+    for (const alias of aliases) {
+      const index = normalised.indexOf(alias);
+      if (index !== -1) {
+        found[canonical] = index;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Turn a store's rich-text description into one plain line.
+ *
+ * Shopify's "Body (HTML)" is literal HTML. Left alone it reaches the model as
+ * markup, and a whole catalog of them crowds out the conversation itself.
+ */
+export function plainText(raw: string): string {
+  const text = (raw || "")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, " ")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#3[49];/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (text.length <= MAX_DESCRIPTION) return text;
+  // Cut on a word so the AI never reads half a word aloud.
+  return text.slice(0, MAX_DESCRIPTION).replace(/\s+\S*$/, "") + "…";
 }
 
 /**
@@ -82,25 +201,50 @@ export function skuFromName(name: string): string {
   return slug || `item-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function parseCSV(csv: string): { products: CSVProduct[]; skipped: number } {
+export function parseCSV(csv: string): ParseResult {
   const lines = csv.replace(/\r\n?/g, "\n").trim().split("\n");
-  if (lines.length < 2) return { products: [], skipped: 0 };
+  const empty: ParseResult = {
+    products: [],
+    skipped: 0,
+    skippedNoName: 0,
+    skippedNoPrice: 0,
+    headers: [],
+    missing: ["name", "price"],
+  };
+  if (lines.length < 2) return empty;
 
-  const headers = splitCSVLine(lines[0]).map((h) => h.toLowerCase());
+  const headers = splitCSVLine(lines[0]).map((h) => h.replace(/^\uFEFF/, "").trim());
+  const columns = resolveColumns(headers);
+
+  const missing: string[] = [];
+  if (columns.name === undefined) missing.push("name");
+  if (columns.price === undefined && columns.price_cents === undefined) missing.push("price");
+
   const products: CSVProduct[] = [];
-  let skipped = 0;
+  let skippedNoName = 0;
+  let skippedNoPrice = 0;
 
   for (let i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
 
     const values = splitCSVLine(lines[i]);
-    const row: Record<string, string> = {};
-    headers.forEach((header, index) => {
-      row[header] = values[index] ?? "";
-    });
+    const at = (key: string): string =>
+      columns[key] === undefined ? "" : (values[columns[key]] ?? "").trim();
 
+    const row = {
+      name: at("name"),
+      price: at("price"),
+      price_cents: at("price_cents"),
+      sku: at("sku"),
+      description: at("description"),
+      currency: at("currency"),
+      status: at("status"),
+    };
+
+    // Shopify repeats a product across rows for each variant and image, with
+    // the title only on the first. Those continuation rows are not products.
     if (!row.name) {
-      skipped++;
+      skippedNoName++;
       continue;
     }
 
@@ -115,18 +259,28 @@ export function parseCSV(csv: string): { products: CSVProduct[]; skipped: number
     }
 
     if (priceCents === null) {
-      skipped++;
+      skippedNoPrice++;
       continue;
     }
+
+    const description = plainText(row.description);
 
     products.push({
       name: row.name,
       sku: row.sku || skuFromName(row.name),
       price_cents: priceCents,
       currency: (row.currency || "USD").toUpperCase(),
-      description: row.description || undefined,
+      description: description || undefined,
+      is_active: !INACTIVE_VALUES.has(row.status.toLowerCase()),
     });
   }
 
-  return { products, skipped };
+  return {
+    products,
+    skipped: skippedNoName + skippedNoPrice,
+    skippedNoName,
+    skippedNoPrice,
+    headers,
+    missing,
+  };
 }
