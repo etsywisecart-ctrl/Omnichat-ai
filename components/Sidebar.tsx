@@ -85,6 +85,11 @@ export default function Sidebar() {
         <span>Try your agent</span>
       </a>
 
+      <a className="navi" href="/channels-setup">
+        <OutlineIcon d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9 M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5 M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5 M19.1 4.9C23 8.8 23 15.2 19.1 19.1 M12 12h.01" />
+        <span>Connect WhatsApp</span>
+      </a>
+
       <a className="navi" href="/team">
         <OutlineIcon d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75" />
         <span>Team</span>
