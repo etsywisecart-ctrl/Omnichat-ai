@@ -1,5 +1,6 @@
 import { supabaseAdmin, serviceRoleKeyProblem } from "@/lib/supabase/server";
 import { generateCustomerReply } from "@/lib/ai/gemini";
+import { replyUsage, QUOTA_MESSAGE } from "@/lib/billing/quota";
 
 /**
  * The web chat widget: the shop's own site as a channel.
@@ -164,6 +165,11 @@ export async function handleWidgetMessage(input: WidgetMessage): Promise<WidgetO
     .eq("customer_identifier", sessionId)
     .maybeSingle();
 
+  // The monthly ceiling, checked before the per-minute one: a shop that has
+  // spent its allowance should be told so, not asked to wait a minute and try
+  // the same thing again.
+  const usage = await replyUsage(businessId);
+
   const rate = await recentCustomerMessages(businessId, existing?.id ?? null);
   if (rate.session >= MAX_PER_SESSION_PER_MINUTE) {
     return { ok: false, status: 429, error: "You're sending messages very quickly — one moment." };
@@ -219,6 +225,20 @@ export async function handleWidgetMessage(input: WidgetMessage): Promise<WidgetO
     body: text,
     created_at: now,
   });
+
+  // Out of allowance: keep the customer's message — it is a real enquiry the
+  // shop will want — but answer honestly instead of spending a reply the shop
+  // has not paid for.
+  if (usage.exceeded) {
+    await supabaseAdmin.from("messages").insert({
+      business_id: businessId,
+      conversation_id: conversationId,
+      sender_type: "system",
+      direction: "outgoing",
+      body: `Monthly reply limit reached (${usage.used}/${usage.limit}).`,
+    });
+    return { ok: true, conversationId, reply: QUOTA_MESSAGE };
+  }
 
   // A human has taken this conversation over. Keep the visitor's message, but
   // don't have the bot talk across the person now handling it.

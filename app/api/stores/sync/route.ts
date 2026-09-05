@@ -15,14 +15,31 @@ export const maxDuration = 60;
  * point is that a price changed in Shopify stops being quoted wrongly without
  * anyone doing anything.
  */
+/**
+ * How many shops one scheduled run will sync.
+ *
+ * A serverless function is killed at its timeout, so "loop over every shop"
+ * works until there are enough shops to exceed it — and then it stops
+ * finishing, silently, and the shops at the end of the list are simply never
+ * synced. Bounded work per run, oldest-synced first, means adding customers
+ * lengthens the cycle instead of breaking it.
+ */
+const STORES_PER_RUN = 20;
+
 async function syncEveryStore() {
   const { data } = await supabaseAdmin
     .from("store_connections")
-    .select("business_id")
-    .eq("sync_enabled", true);
+    .select("business_id, last_synced_at")
+    .eq("sync_enabled", true)
+    // Never-synced first, then whoever has waited longest. A shop cannot be
+    // starved by the ordering, because syncing moves it to the back.
+    .order("last_synced_at", { ascending: true, nullsFirst: true })
+    .limit(STORES_PER_RUN);
 
   const results = [];
   for (const row of (data ?? []) as Array<{ business_id: string }>) {
+    // syncStore never throws — one unreachable store must not abandon the
+    // rest of the batch.
     const result = await syncStore(row.business_id);
     results.push({
       businessId: row.business_id,

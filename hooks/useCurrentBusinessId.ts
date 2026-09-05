@@ -60,6 +60,17 @@ export function useCurrentBusinessId() {
 
       let { data, error } = await lookUp();
 
+      // Nothing yet? This may be someone who was invited before they had an
+      // account. claim_invites attaches any membership addressed to their own
+      // verified email — the row is invisible to them until it does, because
+      // every tenant policy is keyed on already being a member.
+      if (!error && !data?.business_id) {
+        const { data: claimed } = await supabase.rpc("claim_invites");
+        if ((claimed as number | null) ?? 0) {
+          ({ data, error } = await lookUp());
+        }
+      }
+
       // An expired token means we could not ask, not that the answer is no.
       // Returning null here is what told a shop with a full catalog that it
       // had no shop at all.
