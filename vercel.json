@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/stores/sync",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
