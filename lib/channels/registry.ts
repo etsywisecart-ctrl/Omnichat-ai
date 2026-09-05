@@ -32,6 +32,15 @@ export async function sendToChannel(
   text: string,
   channel: ChannelCredentials | null
 ): Promise<SendResult> {
+  // The web widget has no provider to call: the visitor's own browser asks for
+  // new messages, so storing the reply IS delivering it. Falling through to the
+  // credentials check below told an agent the channel "isn't connected yet" and
+  // refused to save what they had typed — leaving a website visitor with no way
+  // to be answered by a human at all.
+  if (channelType === "web") {
+    return { success: true };
+  }
+
   if (!channel?.access_token) {
     return {
       success: false,

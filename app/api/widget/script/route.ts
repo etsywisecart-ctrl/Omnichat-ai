@@ -27,6 +27,7 @@ export async function GET(request: NextRequest) {
 
   var BUSINESS_ID = ${JSON.stringify(businessId)};
   var ENDPOINT = ${JSON.stringify(endpoint)};
+  var INBOX = ${JSON.stringify(`${request.nextUrl.origin}/api/widget/messages`)};
   if (!BUSINESS_ID) return;
   if (window.__omnichatWidgetLoaded) return;
   window.__omnichatWidgetLoaded = true;
@@ -87,6 +88,8 @@ export async function GET(request: NextRequest) {
   var input = root.querySelector(".bar input");
   var send = root.querySelector(".bar button");
   var greeted = false;
+  var lastSeen = "";
+  var watching = null;
 
   function add(text, cls) {
     var el = document.createElement("div");
@@ -97,11 +100,47 @@ export async function GET(request: NextRequest) {
     return el;
   }
 
+  /**
+   * Ask whether a person from the shop has replied.
+   *
+   * The send above is request/response, so a human answering from the Inbox had
+   * no way to reach the visitor — they would type, and nobody would ever see
+   * it. Polling only while the panel is open, because a closed widget has
+   * nobody to show a reply to.
+   */
+  function checkForReplies() {
+    var url =
+      INBOX +
+      "?businessId=" + encodeURIComponent(BUSINESS_ID) +
+      "&sessionId=" + encodeURIComponent(sessionId) +
+      (lastSeen ? "&since=" + encodeURIComponent(lastSeen) : "");
+
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        var replies = (data && data.messages) || [];
+        for (var i = 0; i < replies.length; i++) {
+          add(replies[i].body, "them");
+          lastSeen = replies[i].created_at;
+        }
+      })
+      .catch(function () { /* offline for a moment; the next tick retries */ });
+  }
+
   function toggle() {
     var open = panel.classList.toggle("open");
     if (open) {
-      if (!greeted) { greeted = true; add("Hi! Ask me anything about our products.", "them"); }
+      if (!greeted) {
+        greeted = true;
+        add("Hi! Ask me anything about our products.", "them");
+        // Anything a person said while the widget was shut is still waiting.
+        checkForReplies();
+      }
+      if (!watching) watching = setInterval(checkForReplies, 6000);
       input.focus();
+    } else if (watching) {
+      clearInterval(watching);
+      watching = null;
     }
   }
 
@@ -130,6 +169,8 @@ export async function GET(request: NextRequest) {
         thinking.remove();
         if (result.ok && result.data && result.data.reply) {
           add(result.data.reply, "them");
+          // The bot's answer is already on screen; don't let the poll repeat it.
+          lastSeen = new Date().toISOString();
         } else {
           // Say what the server said. A widget that fails silently is the
           // reason this project spent days guessing at an invisible error.
