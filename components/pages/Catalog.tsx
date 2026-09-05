@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { useProducts, useToggleProduct } from "@/hooks/useProducts";
-import { useUploadProducts, useCreateProduct } from "@/hooks/useProductsV2";
+import { useUploadProducts, useCreateProduct, useUpdateProduct } from "@/hooks/useProductsV2";
 import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
 import { EmptyState, LoadingState, NotConnectedNotice } from "@/components/State";
 
@@ -14,6 +14,9 @@ export default function Catalog() {
   const toggleProduct = useToggleProduct();
   const uploadProducts = useUploadProducts();
   const createProduct = useCreateProduct();
+  const updateProduct = useUpdateProduct();
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [edit, setEdit] = useState({ name: "", price: "", sku: "", description: "" });
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState({ name: "", price: "", sku: "", description: "" });
   const q = useDashboardStore((s) => s.q);
@@ -161,7 +164,7 @@ export default function Catalog() {
             <EmptyState
               icon="🛍️"
               title="No products yet"
-              desc="Sync your CSV catalog or insert rows into the products table to see them here."
+              desc="Connect your Shopify or WooCommerce store, upload a CSV, or add one by hand."
             />
           </div>
         ) : (
@@ -170,7 +173,7 @@ export default function Catalog() {
               <span>Product</span>
               <span>Price</span>
               <span>Source</span>
-              <span>Updated</span>
+              <span>Edit</span>
               <span>Active</span>
             </div>
             {filtered.map((p) => {
@@ -179,6 +182,77 @@ export default function Catalog() {
                 .map((w) => w[0])
                 .slice(0, 2)
                 .join("");
+
+              if (editingId === p.id) {
+                return (
+                  <form
+                    className="trow"
+                    key={p.id}
+                    style={{ display: "block", padding: 14 }}
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      updateProduct.mutate(
+                        { id: p.id, ...edit },
+                        {
+                          onSuccess: () => {
+                            say(`Saved ${edit.name}`);
+                            setEditingId(null);
+                          },
+                          onError: (err) =>
+                            say(err instanceof Error ? err.message : "Couldn't save that change"),
+                        }
+                      );
+                    }}
+                  >
+                    <div className="fx ac gap8 wrap" style={{ marginBottom: 8 }}>
+                      <input
+                        className="inp"
+                        style={{ flex: "2 1 200px" }}
+                        required
+                        autoFocus
+                        value={edit.name}
+                        onChange={(e) => setEdit({ ...edit, name: e.target.value })}
+                      />
+                      <input
+                        className="inp"
+                        style={{ flex: "1 1 110px" }}
+                        required
+                        inputMode="decimal"
+                        value={edit.price}
+                        onChange={(e) => setEdit({ ...edit, price: e.target.value })}
+                      />
+                      <input
+                        className="inp"
+                        style={{ flex: "1 1 130px" }}
+                        placeholder="Product code"
+                        value={edit.sku}
+                        onChange={(e) => setEdit({ ...edit, sku: e.target.value })}
+                      />
+                    </div>
+                    <input
+                      className="inp w100"
+                      style={{ marginBottom: 8 }}
+                      placeholder="Description — the agent reads this out to customers"
+                      value={edit.description}
+                      onChange={(e) => setEdit({ ...edit, description: e.target.value })}
+                    />
+                    <div className="fx ac gap8">
+                      <button className="btn-p" type="submit" disabled={updateProduct.isPending}>
+                        {updateProduct.isPending ? "Saving…" : "Save"}
+                      </button>
+                      <button className="btn" type="button" onClick={() => setEditingId(null)}>
+                        Cancel
+                      </button>
+                      {p.source === "api" && (
+                        <span className="mut fs11">
+                          Synced from your store — the next sync will overwrite this.
+                        </span>
+                      )}
+                    </div>
+                  </form>
+                );
+              }
+
               return (
                 <div className="trow prow" key={p.id}>
                   <div className="fx ac gap12" style={{ minWidth: 0 }}>
@@ -194,7 +268,23 @@ export default function Catalog() {
                   <span>
                     <span className="ftag">{p.source}</span>
                   </span>
-                  <span className="mut fs12">{new Date(p.updated_at).toLocaleDateString()}</span>
+                  <span className="mut fs12">
+                    <button
+                      className="btn"
+                      style={{ padding: "2px 8px", fontSize: 12 }}
+                      onClick={() => {
+                        setEditingId(p.id);
+                        setEdit({
+                          name: p.name,
+                          price: (p.price_cents / 100).toFixed(2),
+                          sku: p.sku ?? "",
+                          description: p.description ?? "",
+                        });
+                      }}
+                    >
+                      Edit
+                    </button>
+                  </span>
                   <button
                     className={"tgl" + (p.is_active ? " on" : "")}
                     onClick={() => toggleProduct.mutate({ id: p.id, isActive: !p.is_active })}

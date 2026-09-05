@@ -78,6 +78,9 @@ export interface Database {
           business_id: string;
           name: string;
           sku: string;
+          // The column has always existed and the AI quotes it to customers;
+          // it was simply missing from these hand-written types.
+          description: string | null;
           price_cents: number;
           currency: string;
           source: "csv" | "manual" | "api";

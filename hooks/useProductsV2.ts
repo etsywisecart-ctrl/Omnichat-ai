@@ -109,6 +109,55 @@ export function useCreateProduct() {
   });
 }
 
+export interface ProductEdit {
+  id: string;
+  name: string;
+  price: string;
+  sku?: string;
+  description?: string;
+}
+
+/**
+ * Edit a product already in the catalog.
+ *
+ * Takes the price as typed and converts it here, exactly as the importer and
+ * the add form do — three places a price is entered, one rule for reading it.
+ */
+export function useUpdateProduct() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: ProductEdit) => {
+      const name = input.name.trim();
+      if (!name) throw new Error("Give the product a name.");
+
+      const amount = Number.parseFloat((input.price || "").replace(/[^0-9.]/g, ""));
+      if (!Number.isFinite(amount) || amount < 0) {
+        throw new Error("Enter a price, like 32.00");
+      }
+
+      const { error } = await supabase
+        .from("products")
+        .update({
+          name,
+          sku: input.sku?.trim() || undefined,
+          description: input.description?.trim() || null,
+          price_cents: Math.round(amount * 100),
+          updated_at: new Date().toISOString(),
+        } as never)
+        .eq("id", input.id);
+
+      if (error) {
+        if (error.code === "23505") {
+          throw new Error(`Another product already uses the code "${input.sku?.trim()}".`);
+        }
+        throw error;
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["products"] }),
+  });
+}
+
 export function useUploadProducts() {
   const qc = useQueryClient();
 

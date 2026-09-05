@@ -85,6 +85,11 @@ export default function Sidebar() {
         <span>Try your agent</span>
       </a>
 
+      <a className="navi" href="/stores">
+        <OutlineIcon d="M3 9h18l-1.5 11a2 2 0 0 1-2 1.8H6.5a2 2 0 0 1-2-1.8z M3 9l2-6h14l2 6 M9 13a3 3 0 0 0 6 0" />
+        <span>Connect store</span>
+      </a>
+
       <a className="navi" href="/widget">
         <OutlineIcon d="M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-4 4v-4H5a2 2 0 0 1-2-2z" />
         <span>Website chat</span>
