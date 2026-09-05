@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase/client";
 import { useSession } from "./useSession";
+import { isExpiredSession, ensureFreshSession } from "@/lib/supabase/session";
 
 /**
  * The three states a page actually needs: still working it out, signed in with
@@ -48,13 +49,24 @@ export function useCurrentBusinessId() {
       // user has MULTIPLE `agents` rows for the same `user_id` (duplicate or
       // leftover onboarding rows), which previously made the dashboard treat
       // the business as unresolved. We pick the earliest (owner) row.
-      const { data, error } = await supabase
-        .from("agents")
-        .select("business_id")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
+      const lookUp = () =>
+        supabase
+          .from("agents")
+          .select("business_id")
+          .eq("user_id", userId)
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+      let { data, error } = await lookUp();
+
+      // An expired token means we could not ask, not that the answer is no.
+      // Returning null here is what told a shop with a full catalog that it
+      // had no shop at all.
+      if (isExpiredSession(error) && (await ensureFreshSession())) {
+        ({ data, error } = await lookUp());
+      }
+
       if (error) {
         // PostgREST errors are plain objects (not `Error` instances), so
         // log the real `.message`.

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase/client";
+import { freshAccessToken } from "@/lib/supabase/session";
 import { useCurrentBusinessId } from "./useCurrentBusinessId";
 
 export interface Product {
@@ -165,9 +166,7 @@ export function useUploadProducts() {
     mutationFn: async (file: File) => {
       // The API reads the business from the access token, so the browser
       // never gets to say which business it is importing into.
-      const { data } = await supabase.auth.getSession();
-      const token = data.session?.access_token;
-      if (!token) throw new Error("Sign in to upload a catalog");
+      const token = await freshAccessToken();
 
       const formData = new FormData();
       formData.append("file", file);

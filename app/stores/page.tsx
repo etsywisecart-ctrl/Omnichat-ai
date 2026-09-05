@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { supabase } from "@/lib/supabase/client";
+import { freshAccessToken } from "@/lib/supabase/session";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
 
 /**
@@ -32,9 +33,9 @@ interface Status {
 }
 
 async function authorisedFetch(path: string, init: RequestInit = {}) {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  if (!token) throw new Error("Sign in first.");
+  // Refreshed, not merely read: an hour-old tab still holds a token, and it
+  // is the one the server rejects.
+  const token = await freshAccessToken();
 
   const response = await fetch(path, {
     ...init,

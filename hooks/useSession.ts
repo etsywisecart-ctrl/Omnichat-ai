@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase/client";
+import { ensureFreshSession } from "@/lib/supabase/session";
 
 export function useSession() {
   const [session, setSession] = useState<Session | null>(null);
@@ -10,9 +11,12 @@ export function useSession() {
 
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then((result: { data: { session: Session | null } }) => {
+    // Refresh on load instead of trusting what is stored. A tab reopened the
+    // next morning holds a session whose access token expired hours ago; taking
+    // it at face value means every query fails and the app blames the data.
+    ensureFreshSession().then((fresh) => {
       if (!mounted) return;
-      setSession(result.data.session);
+      setSession(fresh);
       setLoading(false);
     });
     const { data: sub } = supabase.auth.onAuthStateChange((event: string, sessionState: Session | null) => {

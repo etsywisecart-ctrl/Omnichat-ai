@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase/client";
+import { ensureFreshSession, isExpiredSession } from "@/lib/supabase/session";
 import type { Session } from "@supabase/supabase-js";
 
 export default function Onboarding({ session }: { session: Session }) {
@@ -11,6 +12,7 @@ export default function Onboarding({ session }: { session: Session }) {
   const [businessName, setBusinessName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [signedOut, setSignedOut] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -23,10 +25,26 @@ export default function Onboarding({ session }: { session: Session }) {
       // client-side inserts used to 403 on the businesses insert's RETURNING
       // clause, because the agents row (which current_business_id() depends on)
       // didn't exist yet at that point.
-      const { error: rpcErr } = await supabase.rpc("create_business_and_agent", {
-        business_name: businessName,
-        agent_name: name,
-      });
+      const create = () =>
+        supabase.rpc("create_business_and_agent", {
+          business_name: businessName,
+          agent_name: name,
+        });
+
+      let { error: rpcErr } = await create();
+
+      // An access token lasts an hour, and this form is often the first thing
+      // touched after a long gap. Refresh and try once rather than handing
+      // back "JWT expired", which names a cause but no action.
+      if (isExpiredSession(rpcErr)) {
+        if (await ensureFreshSession()) {
+          ({ error: rpcErr } = await create());
+        } else {
+          setSignedOut(true);
+          throw new Error("Your sign-in expired. Sign in again and this will go through.");
+        }
+      }
+
       if (rpcErr) throw rpcErr;
 
       qc.invalidateQueries({ queryKey: ["current-business-id"] });
@@ -76,7 +94,24 @@ export default function Onboarding({ session }: { session: Session }) {
             />
           </div>
 
-          {error && <div className="mut fs12" style={{ color: "var(--err)" }}>{error}</div>}
+          {error && (
+            <div className="mut fs12" style={{ color: "var(--err)" }}>
+              {error}
+            </div>
+          )}
+
+          {signedOut && (
+            <button
+              className="btn w100"
+              type="button"
+              onClick={async () => {
+                await supabase.auth.signOut().catch(() => undefined);
+                window.location.href = "/login";
+              }}
+            >
+              Sign in again
+            </button>
+          )}
 
           <button className="btn-p w100" type="submit" disabled={busy}>
             {busy ? "Creating…" : "Create business"}

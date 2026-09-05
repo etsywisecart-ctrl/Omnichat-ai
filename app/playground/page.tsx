@@ -6,6 +6,7 @@ import { useSession } from "@/hooks/useSession";
 import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { useDashboardStore, isDark } from "@/store/useDashboardStore";
 import { supabase } from "@/lib/supabase/client";
+import { freshAccessToken } from "@/lib/supabase/session";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
 
 interface Turn {
@@ -86,9 +87,7 @@ export default function Playground() {
     setDiagBusy(live ? "live" : "setup");
     setDiagError(null);
     try {
-      const { data } = await supabase.auth.getSession();
-      const token = data.session?.access_token;
-      if (!token) throw new Error("Sign in first");
+      const token = await freshAccessToken();
 
       const res = await fetch(live ? "/api/diagnostics?live=1" : "/api/diagnostics", {
         headers: { Authorization: `Bearer ${token}` },
