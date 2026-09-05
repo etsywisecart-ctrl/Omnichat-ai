@@ -5,6 +5,41 @@ import { useRouter } from "next/navigation";
 import { supabase, isSupabaseConfigured } from "@/lib/supabase/client";
 import { useSession } from "@/hooks/useSession";
 
+/**
+ * Say what to do next, not what the auth service called it.
+ *
+ * Supabase's messages are accurate and unhelpful at the moment they appear:
+ * "User already registered" is shown to someone who has an account and is one
+ * click from using it, and reads as a refusal rather than as directions.
+ */
+function explain(raw: string): { message: string; switchToSignIn?: boolean } {
+  const text = raw.toLowerCase();
+
+  if (text.includes("already registered") || text.includes("already been registered")) {
+    return {
+      message: "You already have an account with this email — signing you in instead.",
+      switchToSignIn: true,
+    };
+  }
+  if (text.includes("invalid login credentials")) {
+    return {
+      message: "That email and password don't match. Check the password, or create an account if you haven't yet.",
+    };
+  }
+  if (text.includes("email not confirmed")) {
+    return {
+      message: "Open the confirmation link in your inbox first, then sign in.",
+    };
+  }
+  if (text.includes("password should be") || text.includes("password must")) {
+    return { message: "That password is too short — use at least six characters." };
+  }
+  if (text.includes("rate limit") || text.includes("too many")) {
+    return { message: "Too many attempts. Wait a minute and try again." };
+  }
+  return { message: raw };
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const { session, loading } = useSession();
@@ -46,7 +81,12 @@ export default function LoginPage() {
         );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+      const raw = err instanceof Error ? err.message : "Something went wrong";
+      const { message, switchToSignIn } = explain(raw);
+      setError(message);
+      // Being told you already have an account, on the page where you can use
+      // it, should move you forward rather than leave you to find the toggle.
+      if (switchToSignIn) setMode("signin");
     } finally {
       setBusy(false);
     }
