@@ -1,12 +1,10 @@
 "use client";
 
-import { useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { useChannels } from "@/hooks/useChannels";
 import { useAgentSettings } from "@/hooks/useSettings";
 import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
-import ConnectWhatsAppModal from "@/components/ConnectWhatsAppModal";
 
 const CHANNEL_META: Record<string, { label: string; sub: string; ab: string; cls: string }> = {
   wa: { label: "WhatsApp", sub: "Meta WhatsApp Cloud API", ab: "WA", cls: "ch lg wa" },
@@ -22,7 +20,6 @@ const STATUS_BADGE: Record<string, string> = {
 };
 
 export default function Channels() {
-  const [showWhatsAppModal, setShowWhatsAppModal] = useState(false);
   const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
   const { data: channels, isLoading } = useChannels();
   const { data: settings } = useAgentSettings();
@@ -87,7 +84,13 @@ export default function Channels() {
                     <div className="kvr" style={{ justifyContent: "flex-end" }}>
                       <button
                         className="btn sm"
-                        onClick={() => (chId === "wa" && businessId ? setShowWhatsAppModal(true) : say(`Wire this to your ${meta.label} OAuth/connect flow`))}
+                        onClick={() => {
+                          // One place to connect a channel. The modal this
+                          // replaced printed a webhook URL on a placeholder
+                          // domain, at a path that is not the WhatsApp
+                          // webhook — following it pointed Meta at nothing.
+                          window.location.href = chId === "web" ? "/widget" : "/channels-setup";
+                        }}
                       >
                         Connect {meta.label}
                       </button>
@@ -158,13 +161,6 @@ export default function Channels() {
           </div>
         )}
 
-        {showWhatsAppModal && businessId && (
-          <ConnectWhatsAppModal
-            businessId={businessId}
-            onClose={() => setShowWhatsAppModal(false)}
-            onSuccess={() => setShowWhatsAppModal(false)}
-          />
-        )}
       </div>
     </div>
   );
