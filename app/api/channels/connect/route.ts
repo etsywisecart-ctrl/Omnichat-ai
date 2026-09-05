@@ -34,13 +34,35 @@ export async function GET(request: NextRequest) {
 
   const { data } = await supabaseAdmin
     .from("channels")
-    .select("channel_type, status, access_token, app_secret, verify_token, phone_number_id, page_id, instagram_business_account_id")
+    .select("id, channel_type, status, access_token, app_secret, verify_token, phone_number_id, page_id, instagram_business_account_id")
     .eq("business_id", ctx.businessId);
+
+  const rows = (data ?? []) as Array<Record<string, string | null>>;
+
+  // Fill in a verify token for any connection that has none.
+  //
+  // A channel saved before tokens existed — or by the older modal, which left
+  // the field blank — can never finish its webhook setup: Meta asks for a
+  // token to echo back, and the page had nothing to show, so it hid the step
+  // rather than admitting the connection was incomplete. Generating it on
+  // read means the setup page is always able to finish the job.
+  await Promise.all(
+    rows
+      .filter((row) => !row.verify_token)
+      .map(async (row) => {
+        const token = `omni_${crypto.randomBytes(16).toString("hex")}`;
+        const { error } = await supabaseAdmin
+          .from("channels")
+          .update({ verify_token: token })
+          .eq("id", row.id as string);
+        if (!error) row.verify_token = token;
+      })
+  );
 
   const origin = request.nextUrl.origin;
 
   return NextResponse.json({
-    channels: ((data ?? []) as Array<Record<string, string | null>>).map((row) => ({
+    channels: rows.map((row) => ({
       channelType: row.channel_type,
       status: row.status,
       token: masked(row.access_token),
