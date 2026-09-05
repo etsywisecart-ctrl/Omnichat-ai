@@ -4,12 +4,12 @@ import { useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { useProducts, useToggleProduct } from "@/hooks/useProducts";
 import { useUploadProducts, useCreateProduct, useUpdateProduct } from "@/hooks/useProductsV2";
-import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
+import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { EmptyState, LoadingState, NotConnectedNotice } from "@/components/State";
 
 export default function Catalog() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
+  const { missing } = useBusinessGate();
   const { data: prods, isLoading } = useProducts();
   const toggleProduct = useToggleProduct();
   const uploadProducts = useUploadProducts();
@@ -23,7 +23,7 @@ export default function Catalog() {
   const setQuery = useDashboardStore((s) => s.setQuery);
   const say = useDashboardStore((s) => s.say);
 
-  const notConnected = !bizLoading && !businessId;
+  const notConnected = missing;
   const list = prods || [];
   const qq = q.trim().toLowerCase();
   const filtered = list.filter(

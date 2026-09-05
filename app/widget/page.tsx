@@ -2,8 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useSession } from "@/hooks/useSession";
-import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
+import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { supabase } from "@/lib/supabase/client";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
 
@@ -15,8 +14,7 @@ import { LoadingState, NotConnectedNotice } from "@/components/State";
  * answers on WhatsApp answers on the shop's storefront, into the same Inbox.
  */
 export default function WidgetPage() {
-  const { session, loading: sessionLoading } = useSession();
-  const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
+  const { session, businessId, loading: gateLoading, missing } = useBusinessGate();
 
   const [enabled, setEnabled] = useState(false);
   const [origins, setOrigins] = useState("");
@@ -98,7 +96,7 @@ export default function WidgetPage() {
     }
   };
 
-  if (sessionLoading || bizLoading) return <LoadingState />;
+  if (gateLoading) return <LoadingState />;
 
   return (
     <div className="app">
@@ -125,7 +123,7 @@ export default function WidgetPage() {
             <Link href="/login">Sign in</Link> to set up the widget.
           </div>
         )}
-        {session && !businessId && <NotConnectedNotice />}
+        {missing && <NotConnectedNotice />}
 
         {session && businessId && !loading && (
           <>

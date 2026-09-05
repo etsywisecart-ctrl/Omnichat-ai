@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSession } from "@/hooks/useSession";
-import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
+import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { useDashboardStore, isDark } from "@/store/useDashboardStore";
 import { supabase } from "@/lib/supabase/client";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
@@ -63,8 +63,7 @@ const SOURCE_LABEL: Record<string, { text: string; cls: string }> = {
  * Gemini and searched your real products.
  */
 export default function Playground() {
-  const { session, loading: sessionLoading } = useSession();
-  const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
+  const { session, businessId, loading: gateLoading, missing } = useBusinessGate();
   const themeOverride = useDashboardStore((s) => s.themeOverride);
   const sysDark = useDashboardStore((s) => s.sysDark);
 
@@ -152,7 +151,7 @@ export default function Playground() {
 
   const dark = isDark({ themeOverride, sysDark });
 
-  if (sessionLoading || bizLoading) {
+  if (gateLoading) {
     return (
       <div className={"app" + (dark ? " dark" : "")}>
         <div className="f1" style={{ padding: 24 }}>
@@ -183,7 +182,7 @@ export default function Playground() {
             <Link href="/login">Sign in</Link> to use the playground.
           </div>
         )}
-        {session && !businessId && <NotConnectedNotice />}
+        {missing && <NotConnectedNotice />}
 
         <div className="card" style={{ marginTop: 12, padding: 14 }}>
           <div className="fx ac gap8 wrap">

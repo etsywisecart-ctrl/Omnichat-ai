@@ -3,6 +3,31 @@ import { supabase } from "@/lib/supabase/client";
 import { useSession } from "./useSession";
 
 /**
+ * The three states a page actually needs: still working it out, signed in with
+ * a business, or signed in without one.
+ *
+ * useCurrentBusinessId returns `undefined` while its query is pending or
+ * disabled, and `null` only once the lookup has run and found no agent row.
+ * Pages that tested the value for truthiness could not tell those apart, so a
+ * shop with 89 products was shown "no business connected" during the moment
+ * between the session resolving and the lookup starting.
+ */
+export function useBusinessGate() {
+  const { session, loading: sessionLoading } = useSession();
+  const { data, isLoading } = useCurrentBusinessId();
+
+  const stillResolving = sessionLoading || isLoading || (Boolean(session) && data === undefined);
+
+  return {
+    session,
+    businessId: (data ?? null) as string | null,
+    loading: stillResolving,
+    /** Signed in, lookup finished, genuinely no business attached. */
+    missing: Boolean(session) && !stillResolving && data === null,
+  };
+}
+
+/**
  * Resolves the business_id for the currently authenticated agent.
  * Returns null until Supabase Auth is signed in AND an `agents` row
  * exists for that user — every data hook in this app treats a null

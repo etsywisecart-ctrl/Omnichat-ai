@@ -29,8 +29,8 @@ export function LoadingState({ rows = 3 }: { rows?: number }) {
 export function NotConnectedNotice() {
   return (
     <div className="notice">
-      Connect your Supabase project (fill in <span className="mono">.env.local</span>) and add a signed-in agent
-      row to start seeing real data here.
+      This account isn&apos;t attached to a shop yet. Sign out and back in to finish setting one
+      up — if it keeps saying this, your sign-in worked but no shop was created for it.
     </div>
   );
 }

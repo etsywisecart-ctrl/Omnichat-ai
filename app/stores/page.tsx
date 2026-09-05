@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { useSession } from "@/hooks/useSession";
-import { useCurrentBusinessId } from "@/hooks/useCurrentBusinessId";
+import { useBusinessGate } from "@/hooks/useCurrentBusinessId";
 import { supabase } from "@/lib/supabase/client";
 import { LoadingState, NotConnectedNotice } from "@/components/State";
 
@@ -61,8 +60,7 @@ function whenever(iso: string | null | undefined): string {
 }
 
 export default function StoresPage() {
-  const { session, loading: sessionLoading } = useSession();
-  const { data: businessId, isLoading: bizLoading } = useCurrentBusinessId();
+  const { session, businessId, loading: gateLoading, missing } = useBusinessGate();
 
   const [status, setStatus] = useState<Status | null>(null);
   const [provider, setProvider] = useState<"shopify" | "woocommerce">("shopify");
@@ -145,7 +143,7 @@ export default function StoresPage() {
     }
   };
 
-  if (sessionLoading || bizLoading) return <LoadingState />;
+  if (gateLoading) return <LoadingState />;
 
   return (
     <div className="app">
@@ -172,7 +170,7 @@ export default function StoresPage() {
             <Link href="/login">Sign in</Link> to connect a store.
           </div>
         )}
-        {session && !businessId && <NotConnectedNotice />}
+        {missing && <NotConnectedNotice />}
 
         {session && businessId && status?.setupRequired && (
           <div className="notice" style={{ marginBottom: 12 }}>
