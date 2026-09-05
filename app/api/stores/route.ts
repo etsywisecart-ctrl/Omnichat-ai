@@ -17,6 +17,27 @@ export const dynamic = "force-dynamic";
  * store is connected without handing the token to the page.
  */
 
+/**
+ * Has the one-off migration not been run yet?
+ *
+ * PostgREST does not say "relation does not exist" — it answers from its
+ * schema cache with "Could not find the table 'public.store_connections' in
+ * the schema cache" (PGRST205). Matching only the Postgres wording meant the
+ * owner saw that sentence raw, which names no action they can take.
+ */
+function tableIsMissing(error: { message?: string; code?: string } | null): boolean {
+  if (!error) return false;
+  if (error.code === "PGRST205" || error.code === "42P01") return true;
+  const message = error.message ?? "";
+  return (
+    /store_connections/i.test(message) &&
+    /(does not exist|schema cache|could not find the table)/i.test(message)
+  );
+}
+
+const RUN_THE_MIGRATION =
+  "The store_connections table hasn't been created yet. Open Supabase → SQL Editor, run the script in supabase/migrations/002_store_connections.sql, then connect again.";
+
 /** `shpat_ab…7f9c` — enough to recognise, useless to reuse. */
 function masked(secret: string | null | undefined): string | null {
   if (!secret) return null;
@@ -28,11 +49,17 @@ export async function GET(request: NextRequest) {
   const ctx = await resolveBusiness(request);
   if (!ctx) return NextResponse.json(UNAUTHORIZED, { status: 401 });
 
-  const { data } = await supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from("store_connections")
     .select("*")
     .eq("business_id", ctx.businessId)
     .maybeSingle();
+
+  // Say it on the way in, so the setup step is named before anyone types a
+  // secret into a form that cannot save it.
+  if (tableIsMissing(error)) {
+    return NextResponse.json({ connected: false, setupRequired: true, message: RUN_THE_MIGRATION });
+  }
 
   const connection = data as StoreConnection | null;
   if (!connection) return NextResponse.json({ connected: false });
@@ -114,13 +141,9 @@ export async function POST(request: NextRequest) {
   if (saveError) {
     // The table is created by a migration the owner runs once, so name that
     // rather than reporting a database error they cannot act on.
-    const missing = /relation .*store_connections.* does not exist/i.test(saveError.message);
+    const missing = tableIsMissing(saveError);
     return NextResponse.json(
-      {
-        message: missing
-          ? "The store_connections table doesn't exist yet. Run supabase/migrations/002_store_connections.sql in Supabase → SQL Editor, then connect again."
-          : saveError.message,
-      },
+      { message: missing ? RUN_THE_MIGRATION : saveError.message, setupRequired: missing },
       { status: missing ? 503 : 500 }
     );
   }

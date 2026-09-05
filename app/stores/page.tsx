@@ -19,6 +19,9 @@ import { LoadingState, NotConnectedNotice } from "@/components/State";
 
 interface Status {
   connected: boolean;
+  /** The one-off database migration hasn't been run yet. */
+  setupRequired?: boolean;
+  message?: string;
   provider?: "shopify" | "woocommerce";
   storeUrl?: string;
   credential?: string | null;
@@ -170,6 +173,15 @@ export default function StoresPage() {
           </div>
         )}
         {session && !businessId && <NotConnectedNotice />}
+
+        {session && businessId && status?.setupRequired && (
+          <div className="notice" style={{ marginBottom: 12 }}>
+            <strong>One setup step first.</strong>
+            <p className="fs12" style={{ margin: "6px 0 0" }}>
+              {status.message} It takes about ten seconds and only has to be done once.
+            </p>
+          </div>
+        )}
 
         {session && businessId && (
           <>
