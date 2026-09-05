@@ -6,6 +6,15 @@ import { supabase } from "@/lib/supabase/client";
 import { ensureFreshSession, isExpiredSession } from "@/lib/supabase/session";
 import type { Session } from "@supabase/supabase-js";
 
+/**
+ * The fallback, not the route.
+ *
+ * A shop is normally built during the first sign-in from what was typed at
+ * signup, or claimed from an invite. This screen is what is left when neither
+ * applied — an account made before the business name was asked for, or an
+ * invite sent to a different address than the one they signed up with. Saying
+ * which is the difference between a form and a dead end.
+ */
 export default function Onboarding({ session }: { session: Session }) {
   const qc = useQueryClient();
   const [name, setName] = useState("");
@@ -71,8 +80,16 @@ export default function Onboarding({ session }: { session: Session }) {
           Set up your business
         </h1>
         <p className="mut fs12" style={{ marginBottom: 18 }}>
-          You&apos;re signed in as {session.user.email}. Create your business to start using the dashboard.
+          You&apos;re signed in as <strong>{session.user.email}</strong>, but no shop is attached to
+          it yet. Name it below and you&apos;re in.
         </p>
+
+        <div className="notice fs12" style={{ marginBottom: 18 }}>
+          Expecting to join a colleague&apos;s shop? Ask them to invite{" "}
+          <strong>{session.user.email}</strong> from their Team page — an invite has to match the
+          address you signed in with. Don&apos;t create a shop here, or you&apos;ll end up with an
+          empty one of your own.
+        </div>
 
         <form onSubmit={handleSubmit} className="col gap12">
           <div>

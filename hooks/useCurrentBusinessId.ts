@@ -60,14 +60,14 @@ export function useCurrentBusinessId() {
 
       let { data, error } = await lookUp();
 
-      // Nothing yet? This may be someone who was invited before they had an
-      // account. claim_invites attaches any membership addressed to their own
-      // verified email — the row is invisible to them until it does, because
-      // every tenant policy is keyed on already being a member.
+      // No membership yet. ensure_business settles all three reasons that can
+      // be true — an invite waiting to be claimed, a business named at signup
+      // and not yet built, or genuinely nothing — in one call, so the app only
+      // falls back to asking when there is actually nothing to go on.
       if (!error && !data?.business_id) {
-        const { data: claimed } = await supabase.rpc("claim_invites");
-        if ((claimed as number | null) ?? 0) {
-          ({ data, error } = await lookUp());
+        const { data: ensured } = await supabase.rpc("ensure_business");
+        if (ensured) {
+          return ensured as string;
         }
       }
 

@@ -47,6 +47,8 @@ export default function LoginPage() {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [businessName, setBusinessName] = useState("");
   const [busy, setBusy] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -106,11 +108,18 @@ export default function LoginPage() {
         const { error } = await supabase.auth.signUp({
           email,
           password,
-          options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
+          options: {
+            emailRedirectTo: `${window.location.origin}/auth/callback`,
+            // Carried on the account itself, so the shop can be built during
+            // the first sign-in rather than by a form afterwards — the form
+            // being where people were dropping out with a confirmed account
+            // and nothing working.
+            data: { full_name: fullName.trim(), business_name: businessName.trim() },
+          },
         });
         if (error) throw error;
         setNotice(
-          "Account created. If email confirmation is on, open the link in your inbox — it will bring you back here signed in. Otherwise you're signed in already."
+          `Account created for ${businessName.trim() || "your shop"}. Open the link in your inbox — it brings you straight to your dashboard.`
         );
       }
     } catch (err) {
@@ -157,6 +166,35 @@ export default function LoginPage() {
         )}
 
         <form onSubmit={handleSubmit} className="col gap12">
+          {mode === "signup" && (
+            <>
+              <div>
+                <div className="flab" style={{ marginBottom: 6 }}>
+                  Your name
+                </div>
+                <input
+                  className="inp w100"
+                  required
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  placeholder="Maya Chen"
+                />
+              </div>
+              <div>
+                <div className="flab" style={{ marginBottom: 6 }}>
+                  Business name
+                </div>
+                <input
+                  className="inp w100"
+                  required
+                  value={businessName}
+                  onChange={(e) => setBusinessName(e.target.value)}
+                  placeholder="Maren Studio"
+                />
+              </div>
+            </>
+          )}
+
           <div>
             <div className="flab" style={{ marginBottom: 6 }}>
               Email
