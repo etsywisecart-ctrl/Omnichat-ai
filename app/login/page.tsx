@@ -48,12 +48,45 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!loading && session) router.replace("/");
   }, [loading, session, router]);
+
+  /**
+   * Email a link that lets someone set a new password.
+   *
+   * Without this the only way back into an account with a forgotten password
+   * was for somebody with Supabase access to change it by hand — which is not
+   * a recovery path, it is a person.
+   */
+  const sendReset = async () => {
+    if (!email.trim()) {
+      setError("Type your email address first, then ask for the link.");
+      return;
+    }
+    setResetting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        // The marker survives the round trip, so the page it lands on knows to
+        // offer a new password rather than treating it as an ordinary sign-in.
+        redirectTo: `${window.location.origin}/auth/callback?mode=reset`,
+      });
+      if (resetError) throw resetError;
+      setNotice(
+        `If ${email.trim()} has an account, a link to set a new password is on its way. It expires in an hour.`
+      );
+    } catch (err) {
+      setError(explain(err instanceof Error ? err.message : "Couldn't send that link").message);
+    } finally {
+      setResetting(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -159,6 +192,14 @@ export default function LoginPage() {
             {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Sign up"}
           </button>
         </form>
+
+        {mode === "signin" && (
+          <div className="fx jc" style={{ marginTop: 12 }}>
+            <button className="btn sm" type="button" onClick={sendReset} disabled={resetting}>
+              {resetting ? "Sending…" : "Forgot your password?"}
+            </button>
+          </div>
+        )}
 
         <div className="fx jc mt16">
           <button

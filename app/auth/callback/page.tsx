@@ -20,7 +20,7 @@ import { supabase } from "@/lib/supabase/client";
  */
 export default function AuthCallback() {
   const router = useRouter();
-  const [status, setStatus] = useState<"working" | "ok" | "failed">("working");
+  const [status, setStatus] = useState<"working" | "ok" | "failed" | "setPassword">("working");
   const [problem, setProblem] = useState<string | null>(null);
 
   // "Email+link+is+invalid" — the query decoder leaves the pluses behind.
@@ -29,8 +29,17 @@ export default function AuthCallback() {
   useEffect(() => {
     let cancelled = false;
 
+    // A password-reset link arrives here signed in, which is not the end of the
+    // journey — the person came to change their password, and dropping them on
+    // the dashboard leaves the old one in place.
+    const isReset = new URL(window.location.href).searchParams.get("mode") === "reset";
+
     const finish = (nextStatus: "ok" | "failed", detail?: string) => {
       if (cancelled) return;
+      if (nextStatus === "ok" && isReset) {
+        setStatus("setPassword");
+        return;
+      }
       setStatus(nextStatus);
       if (detail) setProblem(detail);
       if (nextStatus === "ok") setTimeout(() => router.replace("/"), 1200);
@@ -74,6 +83,7 @@ export default function AuthCallback() {
         <h1 className="fs20 fw7" style={{ marginBottom: 6 }}>
           {status === "working" && "Confirming your email…"}
           {status === "ok" && "You're confirmed"}
+          {status === "setPassword" && "Choose a new password"}
           {status === "failed" && "That link didn't work"}
         </h1>
 
@@ -81,9 +91,9 @@ export default function AuthCallback() {
           <p className="mut fs12">One moment — finishing your sign-in.</p>
         )}
 
-        {status === "ok" && (
-          <p className="mut fs12">Taking you to your dashboard…</p>
-        )}
+        {status === "ok" && <p className="mut fs12">Taking you to your dashboard…</p>}
+
+        {status === "setPassword" && <SetNewPassword />}
 
         {status === "failed" && (
           <>
@@ -98,6 +108,68 @@ export default function AuthCallback() {
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Set a new password, using the session the recovery link just established.
+ *
+ * The link is the proof of identity — Supabase has already verified the
+ * mailbox by the time this renders — so all that is left is the new password.
+ */
+function SetNewPassword() {
+  const router = useRouter();
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (password.length < 6) {
+      setProblem("Use at least six characters.");
+      return;
+    }
+    setBusy(true);
+    setProblem(null);
+    try {
+      const { error } = await supabase.auth.updateUser({ password });
+      if (error) throw error;
+      setDone(true);
+      setTimeout(() => router.replace("/"), 1200);
+    } catch (err) {
+      setProblem(err instanceof Error ? err.message : "Couldn't set that password.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (done) return <p className="mut fs12">Password changed. Taking you to your dashboard…</p>;
+
+  return (
+    <form onSubmit={save} className="col gap12">
+      <p className="mut fs12" style={{ margin: 0 }}>
+        You&rsquo;re signed in from the link. Pick a password and you&rsquo;re done.
+      </p>
+      <input
+        className="inp w100"
+        type="password"
+        required
+        autoFocus
+        minLength={6}
+        placeholder="New password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
+      <button className="btn-p w100" type="submit" disabled={busy}>
+        {busy ? "Saving…" : "Save password"}
+      </button>
+      {problem && (
+        <p className="fs12" style={{ color: "var(--err)", margin: 0 }}>
+          {problem}
+        </p>
+      )}
+    </form>
   );
 }
 
